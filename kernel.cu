@@ -74,7 +74,7 @@ __global__ void sum_reduction(float* v, float* v_r) {
 	if (threadIdx.x == 0) {
 		v_r[blockIdx.x] = partial_sum[0];
 		//printf("result: %.3f\n", partial_sum[0]);
-		printf("%4d::%.3f\n", blockIdx.x, v_r[blockIdx.x]);
+		//printf("%4d::%.3f\n", blockIdx.x, v_r[blockIdx.x]);
 	}
 }
 
@@ -574,7 +574,6 @@ int main() {
 	sum_reduction	<< <1, 32 >> > (dev_eta, dev_eta);//size
 	
 	genW			<< <1024, 40 >> > (dev_temp_u_opt, dev_eta, dev_w_tilde, dev_V);
-
 	wsum_reduction	<< <40, 1024 >> > (dev_temp_u_opt, dev_u_opt);
 	cudaEventRecord(stop, 0);
 
