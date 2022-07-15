@@ -3,10 +3,14 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <iostream>
+#include <fstream>
+#include <string.h>
 #include <assert.h>
 #include <math.h>
 #include <curand_kernel.h>
 #include <curand.h>
+
+using namespace std;
 
 #define SIZE		256
 #define SHMEM_SIZE	256 
@@ -49,9 +53,6 @@ __global__ void sum_reduction(float* v, float* v_r) {
 	// Allocate shared memory
 	__shared__ float partial_sum[64];
 
-	// Calculate thread ID
-	int tid = blockIdx.x * blockDim.x + threadIdx.x;
-
 	// Load elements AND do first add of reduction
 	// Vector now 2x as long as number of threads, so scale i
 	int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
@@ -82,7 +83,7 @@ __global__ void printVar(float* var) {
 	printf("====%.3f====", var[0]);
 }
 
-__device__ State bicycleModel(State state, Control u) {
+__host__ __device__ State bicycleModel(State state, Control u) {
 	/*  Linear bicycle model, which geneates state_dot. Then by integrating the state_dot, 
 		we can then get the nest state x_k+1*/
 
@@ -103,7 +104,7 @@ __device__ State bicycleModel(State state, Control u) {
 	return state_next;
 }
 
-__device__ Control clampingFcn(Control* u_in) {
+__device__ void clampingFcn(Control* u_in) {
 	/*	Clamping fcn for the perturbated command, acting as a
 		hard contrain*/
 
@@ -311,17 +312,21 @@ __global__ void calcRolloutCost(float* input, float* output) {
 		//printf("%4d::%.3f\n", blockIdx.x, output[blockIdx.x]);
 	}
 }
+__global__ void line() {
+	printf("=====================\n");
+}
+
+__global__ void printfloat(float* f) {
+	int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+	printf("%.3f ", f[i]);
+}
 
 __global__ void min_reduction(float* input, float* output) {
 	/*  Find the rollout with the minimum cost using sum reduction methods, 
 		but changing the "sum" part to "min"*/
 
 	// Allocate shared memory
-	__shared__ float partial_sum[32];
-
-	// Calculate thread ID
-	int tid = blockIdx.x * blockDim.x + threadIdx.x;
-
+	__shared__ float partial_sum[K/32];
 	// Load elements AND do first add of reduction
 	// Vector now 2x as long as number of threads, so scale i
 	int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
@@ -332,6 +337,38 @@ __global__ void min_reduction(float* input, float* output) {
 
 	// Start at 1/2 block stride and divide by two each iteration
 	for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+		// Each thread does work unless it is further than the stride
+		if (threadIdx.x < s) {
+			partial_sum[threadIdx.x] = min(partial_sum[threadIdx.x], partial_sum[threadIdx.x + s]);
+		}
+		__syncthreads();
+	}
+
+	// Let the thread 0 for this block write it's result to main memory
+	// Result is inexed by this block
+	if (threadIdx.x == 0) {
+		output[blockIdx.x] = partial_sum[0];
+		//printf("result: %.3f\n", partial_sum[0]);
+		//printf("%4d::%.3f\n", blockIdx.x, v_r[blockIdx.x]);
+	}
+}
+
+__global__ void min_reduction2(float* input, float* output) {
+	/*  Find the rollout with the minimum cost using sum reduction methods,
+		but changing the "sum" part to "min"*/
+
+		// Allocate shared memory
+	__shared__ float partial_sum[K / 32];
+	// Load elements AND do first add of reduction
+	// Vector now 2x as long as number of threads, so scale i
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	// Store first partial result instead of just the elements
+	partial_sum[threadIdx.x] = input[i];
+	__syncthreads();
+
+	// Start at 1/2 block stride and divide by two each iteration
+	for (int s = blockDim.x /4; s > 0; s >>= 1) {
 		// Each thread does work unless it is further than the stride
 		if (threadIdx.x < s) {
 			partial_sum[threadIdx.x] = min(partial_sum[threadIdx.x], partial_sum[threadIdx.x + s]);
@@ -515,14 +552,13 @@ int main() {
 
 	// Setup parameters and Initialize variables
 	Control* host_V, * dev_V;
-	Control* host_Uopt, * dev_Uopt;
-	float* dev_u0;
+	Control output_u0;
 	float  host_u0[2] = { 2, 0 };
-	Control* host_U, * dev_U;
-	State host_x0 = {150.91,126.71,-0.5,2,0};
+	Control host_U[int(N_HRZ)], * dev_U;
+	State host_x0 = {150.91,126.71,-0.2,2,0};
 	State* dev_x0;
 	float  RAND_SCALAR = 2.0;
-	curandState* dev_state;
+	curandState* dev_cstate;
 
 	State* dev_stateList, * host_stateList;
 	float* dev_state_costList;
@@ -554,14 +590,13 @@ int main() {
 	host_mid_intersec = (Pos*)malloc(4 * sizeof(Pos));
 	host_in_intersec = (Pos*)malloc(4 * sizeof(Pos));
 	host_out_intersec = (Pos*)malloc(4 * sizeof(Pos));
-	host_U = (Control*)malloc(N_HRZ * sizeof(Control));
+	//host_U = (Control*)malloc(N_HRZ * sizeof(Control));
 
 	// Setup device memory
-	cudaMalloc((void**)&dev_u0, 2 * sizeof(float));
+	cudaMalloc((void**)&dev_cstate, K * N_HRZ * sizeof(curandState));
 	cudaMalloc((void**)&dev_V, K * N_HRZ * sizeof(Control));
-	cudaMalloc((void**)&dev_state, K * N_HRZ * sizeof(curandState));
-	cudaMalloc((void**)&dev_stateList, K*N_HRZ * sizeof(State));
 	cudaMalloc((void**)&dev_x0, sizeof(State));
+	cudaMalloc((void**)&dev_stateList, K*N_HRZ * sizeof(State));
 	cudaMalloc((void**)&dev_state_costList, K * N_HRZ * sizeof(float));
 	cudaMalloc((void**)&dev_rollout_costList, K * sizeof(float));
 	cudaMalloc((void**)&dev_mid_fcn, 4 * sizeof(Track));
@@ -593,76 +628,94 @@ int main() {
 	cudaMemcpy(dev_in_intersec, host_in_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
 	cudaMemcpy(dev_out_intersec, host_out_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
 
-	// Copy host to device
-	cudaMemcpy(dev_u0, host_u0, 2 * sizeof(float), cudaMemcpyHostToDevice);
-	cudaMemcpy(dev_x0, &host_x0, sizeof(State), cudaMemcpyHostToDevice);
-
 	// Initialize nominal conrtrol
 	for (int n = 0; n < N_HRZ; n++) {
 		host_U[n].vd = host_u0[0];
 		host_U[n].wd = host_u0[1];
 	}
-	cudaMemcpy(dev_U, host_U, N_HRZ * sizeof(Control), cudaMemcpyHostToDevice);
-
-	// Launch kernal functions
-	//cudaEventRecord(start, 0);
 	
-	initCurand		<< <N_HRZ*8, K/8 >> > (dev_state, 1);  // Slow! might not want it in loop?
-	cudaEventRecord(start, 0);
-	//genControlOld		<< <1024, 40 >> > (dev_state, dev_V, dev_u0, RAND_SCALAR);
-	genControl		<< <K, N_HRZ >> > (dev_state, dev_V, dev_U, RAND_SCALAR);  // WRONG! shoud take in a sequence of controls and not a single u
-	
-	genState		<< <K/256, K/4 >> > (dev_stateList, dev_x0, dev_V);
-	
-	costFcn			<< <N_HRZ*4, K/4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn);
+	std::fstream outputFile;
+	// create a name for the file output
+	outputFile.open("MPC_output.csv", ios::out | ios::app);
 
-	calcRolloutCost	<< <K, N_HRZ >> > (dev_state_costList, dev_rollout_costList);
+	for (int it = 0; it < 10000; it++) {
 
-	min_reduction	<< <K/32/2, K/32 >> > (dev_rollout_costList, dev_rho);
-	min_reduction	<< <1     , K/32 >> > (dev_rho, dev_rho);
-	
-	calcWTilde		<< <K / 32, K / 32 >> > (dev_w_tilde, dev_rho, dev_rollout_costList);
-	
-	sum_reduction	<< <K / 32 / 2, K / 32 >> > (dev_w_tilde, dev_eta);
-	sum_reduction	<< <1, K / 32 >> > (dev_eta, dev_eta);//size
-	
-	genW			<< <K, N_HRZ >> > (dev_temp_u_opt, dev_eta, dev_w_tilde, dev_V);
-	wsum_reduction	<< <N_HRZ, K >> > (dev_temp_u_opt, dev_u_opt);
+		cudaMemcpy(dev_U, &host_U, N_HRZ * sizeof(Control), cudaMemcpyHostToDevice);
+		cudaMemcpy(dev_x0, &host_x0, sizeof(State), cudaMemcpyHostToDevice);
 
-	// If 1024 threads are too much for the hardware, the method below can be adapted
+		// Launch kernal functions
+		//cudaEventRecord(start, 0);
 
-	//wsum_reduction_partial << <40, 512 >> > (dev_temp_u_opt, dev_u_opt, 0);
-	//wsum_reduction_partial << <40, 512 >> > (dev_temp_u_opt, dev_u_opt_part, 512);
-	//sumControl << <20, 20 >> > (dev_u_opt_part, dev_u_opt);
-	cudaEventRecord(stop, 0);
+		initCurand << <N_HRZ * 8, K / 8 >> > (dev_cstate, 1);  // Slow! might not want it in loop?
+		cudaEventRecord(start, 0);
 
-	// Show runtime in miliseconds
-	cudaEventSynchronize(stop);
-	cudaEventElapsedTime(&time, start, stop);
-	printf("kernal runtime: %.5f ms\n", time);
-	cudaEventDestroy(start);
-	cudaEventDestroy(stop);
+		genControl << <K, N_HRZ >> > (dev_cstate, dev_V, dev_U, RAND_SCALAR);  // WRONG! shoud take in a sequence of controls and not a single u
 
-	// Acts as a syncing buffer so no need for additional synhronization
-	cudaMemcpy(host_V, dev_V, K*N_HRZ * sizeof(Control), cudaMemcpyDeviceToHost);
-	cudaMemcpy(host_stateList, dev_stateList, K*N_HRZ * sizeof(State), cudaMemcpyDeviceToHost);
-	cudaMemcpy(host_u_opt, dev_u_opt, N_HRZ * sizeof(Control), cudaMemcpyDeviceToHost);
+		genState << <K / 256, K / 4 >> > (dev_stateList, dev_x0, dev_V);
 
-	printf("returned random value is %.1f %.1f %.1f\n", host_V[0].vd, host_V[1].vd, host_V[2].wd);
-	printf("returned state list value is %.1f %.1f %.1f %.1f\n", host_stateList[1].x, host_stateList[1].y, host_stateList[1].phi, host_stateList[1].v0);
-	printf("returned state list value is %.1f %.1f %.1f %.1f\n", host_stateList[5].x, host_stateList[5].y, host_stateList[5].phi, host_stateList[5].v0);
-	for (int i = 0; i < N_HRZ-15; i++) {
-		printf("%2.2f ", host_u_opt[i].vd);
+		costFcn << <N_HRZ * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn);
+
+		calcRolloutCost << <K, N_HRZ >> > (dev_state_costList, dev_rollout_costList);
+
+		min_reduction << <K / 32 / 2, K / 32 >> > (dev_rollout_costList, dev_rho);
+		//line << <1, 1 >> > ();
+		//printfloat << <1, 32 >> > (dev_rho);
+		min_reduction2 << <1, K / 32 >> > (dev_rho, dev_rho);
+
+		calcWTilde << <K / 32, K / 32 >> > (dev_w_tilde, dev_rho, dev_rollout_costList);
+
+		sum_reduction << <K / 32 / 2, K / 32 >> > (dev_w_tilde, dev_eta);
+		sum_reduction << <1, K / 32 >> > (dev_eta, dev_eta);//size
+
+		genW << <K, N_HRZ >> > (dev_temp_u_opt, dev_eta, dev_w_tilde, dev_V);
+		wsum_reduction << <N_HRZ, K >> > (dev_temp_u_opt, dev_u_opt);
+
+		// If 1024 threads are too much for the hardware, the method below can be adapted
+
+		//wsum_reduction_partial << <40, 512 >> > (dev_temp_u_opt, dev_u_opt, 0);
+		//wsum_reduction_partial << <40, 512 >> > (dev_temp_u_opt, dev_u_opt_part, 512);
+		//sumControl << <20, 20 >> > (dev_u_opt_part, dev_u_opt);
+		cudaEventRecord(stop, 0);
+
+		// Show runtime in miliseconds
+		cudaEventSynchronize(stop);
+		cudaEventElapsedTime(&time, start, stop);
+		//printf("kernal runtime: %.5f ms\n", time);
+		cudaEventDestroy(start);
+		cudaEventDestroy(stop);
+
+		// Acts as a syncing buffer so no need for additional synhronization
+		cudaMemcpy(host_V, dev_V, K * N_HRZ * sizeof(Control), cudaMemcpyDeviceToHost);
+		cudaMemcpy(host_stateList, dev_stateList, K * N_HRZ * sizeof(State), cudaMemcpyDeviceToHost);
+		cudaMemcpy(host_u_opt, dev_u_opt, N_HRZ * sizeof(Control), cudaMemcpyDeviceToHost);
+
+		//printf("returned random value is %.1f %.1f %.1f\n", host_V[0].vd, host_V[1].vd, host_V[2].wd);
+		//printf("returned state list value is %.1f %.1f %.1f %.1f\n", host_stateList[1].x, host_stateList[1].y, host_stateList[1].phi, host_stateList[1].v0);
+		//printf("returned state list value is %.1f %.1f %.1f %.1f\n", host_stateList[5].x, host_stateList[5].y, host_stateList[5].phi, host_stateList[5].v0);
+		//printf("vd: ");
+		//for (int i = 0; i < N_HRZ - 15; i++) {
+		//	printf("%2.2f ", host_u_opt[i].vd);
+		//}
+		//printf("\nwd: ");
+		//for (int i = 0; i < N_HRZ - 15; i++) {
+		//	printf("%2.2f ", host_u_opt[i].wd);
+		//}
+		//printf("\n");
+
+		// Might want to write the rollout states to a csv file?
+
+		// Generate the predicted next state with u_opt
+		host_x0 = bicycleModel(host_x0, host_u_opt[0]);
+		//printf("%.3f, %.3f, %.3f, %.3f, %.3f, %.3f\n", host_x0.x, host_x0.y, host_x0.phi, host_x0.v0, host_u_opt[0].vd, host_u_opt[0].wd);
+		outputFile << it << "," << host_x0.x << "," << host_x0.y << "," << host_x0.phi << "," << host_x0.v0 << "," << host_u_opt[0].vd << "," << host_u_opt[0].wd << std::endl;
+		//printf("%.3f, %.3f, %.3f, %.3f\n", host_x0.x, host_x0.y, host_x0.phi, host_x0.v0);
+		// Shift the control by 1 
+		output_u0 = host_u_opt[0];
+		memmove(host_u_opt, &host_u_opt[1], (N_HRZ - 1) * sizeof(Control)); // use memmove instead of memcpy because the destination overlaps the source
+		host_u_opt[int(N_HRZ)] = host_u_opt[int(N_HRZ) - 1];
+		memcpy(host_U, host_u_opt, N_HRZ * sizeof(Control));
 	}
-	printf("\n");
-	for (int i = 0; i < N_HRZ-15; i++) {
-		printf("%2.2f ", host_u_opt[i].wd);
-	}
-	printf("\n");
-
-	// Generate the predicted next state with u_opt
-
-	// Shift the control by 1 
-
+	outputFile.close();
+	
 	return 0;
 }
