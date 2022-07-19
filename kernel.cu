@@ -29,17 +29,17 @@ using namespace std;
 #define W_MAX		1.0f			// Angular acceleration command upper-bound
 #define W_MIN		-1.0f			// Angular acceleration command lower-bound
 #define ROAD_WIDTH  2.0f			// Width of road (unit: m)
-#define LAMBDA      50.0f
+#define LAMBDA      300.0f
 
 #define OFF_ROAD_COST	500.0f		// Penalty for leaving the road
 #define COLLISION_COST	800.0f		// Penalty for colliding into an obstacle
 #define TRACK_ERR_COST	5.0f		// Penalty for tracking error (parting from the middle)
 
 struct Control {
-	float vd, wd, padding;
+	float vd, wd;
 };
 struct State {
-	float x, y, phi, v0, padding;
+	float x, y, phi, v0;
 };
 struct Track {
 	// Track fcn in the form of by + ax + c =0
@@ -50,31 +50,24 @@ struct Pos {
 };
 
 __global__ void sum_reduction(float* v, float* v_r) {
-	// Allocate shared memory
 	__shared__ float partial_sum[64];
 
-	// Load elements AND do first add of reduction
-	// Vector now 2x as long as number of threads, so scale i
+
 	int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
 
-	// Store first partial result instead of just the elements
 	partial_sum[threadIdx.x] = v[i] + v[i + blockDim.x];
 	__syncthreads();
 
-	// Start at 1/2 block stride and divide by two each iteration
 	for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-		// Each thread does work unless it is further than the stride
 		if (threadIdx.x < s) {
 			partial_sum[threadIdx.x] += partial_sum[threadIdx.x + s];
 		}
 		__syncthreads();
 	}
 
-	// Let the thread 0 for this block write it's result to main memory
-	// Result is inexed by this block
 	if (threadIdx.x == 0) {
 		v_r[blockIdx.x] = partial_sum[0];
-		//printf("result: %.3f\n", partial_sum[0]);
+		//printf("result2: %.3f\n", partial_sum[0]);
 		//printf("%4d::%.3f\n", blockIdx.x, v_r[blockIdx.x]);
 	}
 }
@@ -90,17 +83,14 @@ __host__ __device__ State bicycleModel(State state, Control u) {
 	State state_dot;
 	State state_next;
 	float Ka = 2.54;
-	//printf("%.2f %.2f\n", u.vd, u.wd);
 	state_dot.x = state.v0 * cosf(state.phi);
 	state_dot.y = state.v0 * sinf(state.phi);
 	state_dot.phi = u.wd;
 	state_dot.v0 = Ka * state.v0 * (u.vd - state.v0);
-	//printf("%.1f %.1f %.1f %.1f\n", state_dot.x, state_dot.y, state_dot.phi, state_dot.v0);
 	state_next.x = state.x + state_dot.x * T_STP;
 	state_next.y = state.y + state_dot.y * T_STP;
 	state_next.phi = state.phi + state_dot.phi * T_STP;
 	state_next.v0 = state.v0 + state_dot.v0 * T_STP;
-	//printf("%.1f %.1f %.1f %.1f\n", state_next.x, state_next.y, state_next.phi, state_next.v0);
 	return state_next;
 }
 
@@ -112,7 +102,6 @@ __device__ void clampingFcn(Control* u_in) {
 	else if (u_in->vd < V_MIN) { u_in->vd = V_MIN; }
 	if (u_in->wd > W_MAX) { u_in->wd = W_MAX; }
 	else if (u_in->wd < W_MIN) { u_in->wd = W_MIN; }
-	//printf("out %.2f %.2f\n", u_in->vd, u_in->wd);
 }
 
 __device__ float distanceFromTrack(float inner_f, float inner_g, float inner_h,
@@ -121,7 +110,6 @@ __device__ float distanceFromTrack(float inner_f, float inner_g, float inner_h,
 		(Here, from the Tetragon imposing the road infront of the schools library)*/
 
 	float slope[] = { -inner_fcn[0].a, -inner_fcn[1].a, -inner_fcn[2].a, -inner_fcn[3].a };
-	//printf("%.3f %.3f %.3f %.3f\n", slope[0], slope[1], slope[2], slope[3]);
 	float distance = 0.0f;
 	if (inner_f < 0 && inner_g < 0 && inner_h < 0 && inner_i > 0) {
 		distance = fabs(fabs(inner_f) - 0.5 * ROAD_WIDTH / cosf(atanf(slope[0])));
@@ -154,6 +142,10 @@ __device__ float distanceFromTrack(float inner_f, float inner_g, float inner_h,
 		(inner_min > fabs(inner_i)) ? inner_min = fabs(inner_i) : inner_min = inner_min;
 		distance = inner_min - 0.5 * ROAD_WIDTH;
 	}
+	if (distance > ROAD_WIDTH / 2) {
+		distance = 0;
+	}
+
 	return distance;
 }
 
@@ -205,20 +197,16 @@ __global__ void genControlOld(curandState* state, Control* rand, float* u, float
 	rand[idx].vd = curand_normal(&state[idx]) * scalar + u[0];
 	rand[idx].wd = curand_normal(&state[idx]) * scalar + u[1];
 	clampingFcn(&rand[idx]);
-	//printf("%.1f\n", rand[idx].v);
 }
 
 __global__ void genControl(curandState* state, Control* rand, Control* u, float scalar) {
-	/*  Generate V from nominal control U and the generated pertubations E (V = U + E)*/
+	/*  Generate V from nominal control U and the generated pertubations E (V = U + E)
+		mean 0.0 and standard deviation 1.0, scalar: stdev scalar*/
 
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
-	// Generate the random number with mean 0.0 and standard deviation 1.0, scalar: stdev scalar
-	//printf("%.3f %.3f\n", u[threadIdx.x].vd, u[threadIdx.x].wd);
-	//printf("%d\n", idx);
 	rand[idx].vd = curand_normal(&state[idx]) * scalar + u[threadIdx.x].vd;
 	rand[idx].wd = curand_normal(&state[idx]) * scalar + u[threadIdx.x].wd;
 	clampingFcn(&rand[idx]);
-	//printf("%.3f %.3f %.3f\n", curand_normal(&state[idx]) * scalar, u[threadIdx.x].vd, rand[idx].vd);
 }
 
 __global__ void genState(State* state_list, State* init_state, Control* pert_control) {
@@ -229,19 +217,10 @@ __global__ void genState(State* state_list, State* init_state, Control* pert_con
 	*/
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
 	State state_temp = *init_state;
-	//float cost = 0;
-	//printf("%.1f %.1f %.1f %.1f\n", init_state->x, init_state->y, init_state->phi, init_state->v0);
 	for (int n = 0; n < N_HRZ; n++) {
-		//printf("%.3f %.3f\n", pert_control[idx + n * idx].vd, pert_control[idx + n * idx].wd);
-		state_temp = bicycleModel(state_temp, pert_control[n + n * idx]);
+		state_temp = bicycleModel(state_temp, pert_control[n + int(N_HRZ) * idx]); //////???????????????????
 		int listidx = n + (N_HRZ) * idx;
-		//printf("%d::: %.1f %.1f %.1f %.1f\n", n, state_temp.x, state_temp.y, state_temp.phi, state_temp.v0);
 		state_list[listidx] = state_temp;
-		//if (listidx <10) printf("%d:::%.2f %.2f %.2f %.2f\n", listidx, state_list[listidx].x, state_list[listidx].y, state_list[listidx].phi, state_list[listidx].v0);
-		//printf("%d:::%.2f %.2f %.2f %.2f\n", idx + n * idx, state_list[idx + n * idx].x, state_list[idx + n * idx].y, state_list[idx + n * idx].phi, state_list[idx + n * idx].v0);
-		//printf("%.1f ",state_list[idx + n * idx].x);
-		//printf("%.2f %.2f\n", pert_control[idx + n * idx].vd, pert_control[idx + n * idx].wd);
-		//cost += calculateCost(&state_temp, outer_fcn, inner_fcn);
 	}
 	
 }  
@@ -254,10 +233,7 @@ __global__ void costFcn(float* cost_list, State* state_list,
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
 	float state_cost = 0.0f;
 	State state = state_list[idx];
-	//printf("%.3f %.3f %.3f\n", inner_fcn[3].b, inner_fcn[3].a, inner_fcn[3].c);
-	//printf("%.3f %.3f %.3f\n", outer_fcn[0].b, outer_fcn[0].a, outer_fcn[0].c);
-	//if(idx>40000) printf("%d\n", idx);
-	//printf("%d:  %.3f %.3f %.3f %.3f\n", idx, state_list[idx].x, state_list[idx].y, state_list[idx].phi, state_list[idx].v0);  ///////////////////////////////////////////// something wrong here
+
 	float outer_f = outer_fcn[0].b * state.y + outer_fcn[0].a * state.x + outer_fcn[0].c;  
 	float outer_g = outer_fcn[1].b * state.y + outer_fcn[1].a * state.x + outer_fcn[1].c;
 	float outer_h = outer_fcn[2].b * state.y + outer_fcn[2].a * state.x + outer_fcn[2].c;
@@ -267,10 +243,7 @@ __global__ void costFcn(float* cost_list, State* state_list,
 	float inner_g = inner_fcn[1].b * state.y + inner_fcn[1].a * state.x + inner_fcn[1].c;
 	float inner_h = inner_fcn[2].b * state.y + inner_fcn[2].a * state.x + inner_fcn[2].c;
 	float inner_i = inner_fcn[3].b * state.y + inner_fcn[3].a * state.x + inner_fcn[3].c;
-
-	//printf("%.3f %.3f %.3f %.3f\n", inner_f, inner_g, inner_h, inner_i);
 	float distance = distanceFromTrack(inner_f, inner_g, inner_h, inner_i, inner_fcn);
-	//printf("%.3f\n", distance);
 	if ((outer_f > 0 && outer_g < 0 && outer_h < 0 && outer_i>0) && 
 		!(inner_f>0 && inner_g<0 && inner_h<0 && inner_i>0)) {
 		state_cost += 0;
@@ -280,7 +253,6 @@ __global__ void costFcn(float* cost_list, State* state_list,
 	}
 	state_cost += distance / (ROAD_WIDTH / 2) * TRACK_ERR_COST;
 	cost_list[idx] = state_cost;
-	//printf("%.3f\n", cost_list[idx]);
 }
 
 __global__ void calcRolloutCost(float* input, float* output) {
@@ -289,27 +261,42 @@ __global__ void calcRolloutCost(float* input, float* output) {
 		// Allocate shared memory
 	__shared__ float partial_sum[SHMEM_SIZE];
 
-	// Calculate thread ID
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-	// Load elements into shared memory
 	partial_sum[threadIdx.x] = input[tid];
 	__syncthreads();
 
-	// Start at 1/2 block stride and divide by two each iteration
 	for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-		// Each thread does work unless it is further than the stride
 		if (threadIdx.x < s) {
 			partial_sum[threadIdx.x] += partial_sum[threadIdx.x + s];
 		}
 		__syncthreads();
 	}
 
-	// Let the thread 0 for this block write it's result to main memory
-	// Result is inexed by this block
 	if (threadIdx.x == 0) {
 		output[blockIdx.x] = partial_sum[0];
-		//printf("%4d::%.3f\n", blockIdx.x, output[blockIdx.x]);
+	}
+}
+
+__global__ void calcRolloutCost2(float* input, float* output) {
+	__shared__ float partial_sum[40];
+
+	int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+	partial_sum[threadIdx.x] = input[tid];
+	__syncthreads();
+
+	for (int s = 1; s < blockDim.x; s *= 2) {
+		int index = 2 * s * threadIdx.x;
+
+		if (index < blockDim.x) {
+			partial_sum[index] += partial_sum[index + s];
+		}
+		__syncthreads();
+	}
+
+	if (threadIdx.x == 0) {
+		output[blockIdx.x] = partial_sum[0];
 	}
 }
 __global__ void line() {
@@ -318,38 +305,29 @@ __global__ void line() {
 
 __global__ void printfloat(float* f) {
 	int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
-	printf("%.3f ", f[i]);
+	printf("float: %.3f\n", f[i]);
 }
 
 __global__ void min_reduction(float* input, float* output) {
 	/*  Find the rollout with the minimum cost using sum reduction methods, 
 		but changing the "sum" part to "min"*/
 
-	// Allocate shared memory
 	__shared__ float partial_sum[K/32];
-	// Load elements AND do first add of reduction
-	// Vector now 2x as long as number of threads, so scale i
 	int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
 
-	// Store first partial result instead of just the elements
 	partial_sum[threadIdx.x] = min(input[i], input[i + blockDim.x]);
 	__syncthreads();
 
-	// Start at 1/2 block stride and divide by two each iteration
 	for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-		// Each thread does work unless it is further than the stride
 		if (threadIdx.x < s) {
 			partial_sum[threadIdx.x] = min(partial_sum[threadIdx.x], partial_sum[threadIdx.x + s]);
 		}
 		__syncthreads();
 	}
 
-	// Let the thread 0 for this block write it's result to main memory
-	// Result is inexed by this block
 	if (threadIdx.x == 0) {
 		output[blockIdx.x] = partial_sum[0];
 		//printf("result: %.3f\n", partial_sum[0]);
-		//printf("%4d::%.3f\n", blockIdx.x, v_r[blockIdx.x]);
 	}
 }
 
@@ -357,39 +335,27 @@ __global__ void min_reduction2(float* input, float* output) {
 	/*  Find the rollout with the minimum cost using sum reduction methods,
 		but changing the "sum" part to "min"*/
 
-		// Allocate shared memory
 	__shared__ float partial_sum[K / 32];
-	// Load elements AND do first add of reduction
-	// Vector now 2x as long as number of threads, so scale i
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-	// Store first partial result instead of just the elements
 	partial_sum[threadIdx.x] = input[i];
 	__syncthreads();
 
-	// Start at 1/2 block stride and divide by two each iteration
 	for (int s = blockDim.x /4; s > 0; s >>= 1) {
-		// Each thread does work unless it is further than the stride
 		if (threadIdx.x < s) {
 			partial_sum[threadIdx.x] = min(partial_sum[threadIdx.x], partial_sum[threadIdx.x + s]);
 		}
 		__syncthreads();
 	}
 
-	// Let the thread 0 for this block write it's result to main memory
-	// Result is inexed by this block
 	if (threadIdx.x == 0) {
 		output[blockIdx.x] = partial_sum[0];
-		//printf("result: %.3f\n", partial_sum[0]);
-		//printf("%4d::%.3f\n", blockIdx.x, v_r[blockIdx.x]);
 	}
 }
 
 __global__ void calcWTilde(float* w_tilde, float* rho, float* cost_list) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	//printf("%.3f\n", rho[0]);
 	w_tilde[idx] = __expf(-1/LAMBDA*(cost_list[idx]-rho[0]));
-	//printf("%.3f %3f\n", w_tilde[idx], - 1 / LAMBDA * (cost_list[idx] - rho[0]));
 }
 
 __global__ void genW(Control* u_opt, float* eta, float* w_tilde, Control* V) {
@@ -397,35 +363,24 @@ __global__ void genW(Control* u_opt, float* eta, float* w_tilde, Control* V) {
 		u_opt [K,N_HRZ], eta[K], w_tilde[K], V[L, N_HRZ]*/
 
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	//printf("%.3f\n", eta[0]);
 	__shared__ float w;
 	w = w_tilde[blockIdx.x] / eta[0];
-	//printf("%.3f %.3f\n", w_tilde[blockIdx.x], w);
-	//printf("%.3f %.3f\n", V[idx].vd, V[idx].vd);
 	u_opt[idx].vd = V[idx].vd * w;
 	u_opt[idx].wd = V[idx].wd * w;
-	//printf("%.3f %.3f %.3f| %.3f %.3f\n", w, eta[0], w_tilde[blockIdx.x], u_opt[idx].vd, u_opt[idx].wd);
+	//if(blockIdx.x>1000)printf("%d %dw: %.3f\n", blockIdx.x, idx, w);
 }
 
 __global__ void wsum_reduction(Control *input, Control* output) {
 	/*  Calculate the total weighted control of every prediction horizon. 
 		Input [K,N_HRZ]; Output [N_HRZ]*/
 	
-	// Allocate shared memory
 	__shared__ Control partial_sum[1024];
 
-	// Calculate thread ID
 	int tid = threadIdx.x * gridDim.x + blockIdx.x;
-	//if (tid >1000) printf("%d\n", tid);
-	//if(threadIdx.x > 1000) printf("%d %d %d %d | %d\n", threadIdx.x , gridDim.x, blockDim.x, blockIdx.x, tid);
-	// Load elements into shared memory
 	partial_sum[threadIdx.x] = input[tid];
-	//if (blockIdx.x == 0 && threadIdx.x>1000) printf("%d %d\n", threadIdx.x, tid);
 	__syncthreads();
 
-	// Start at 1/2 block stride and divide by two each iteration
 	for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-		// Each thread does work unless it is further than the stride
 		if (threadIdx.x < s) {
 			partial_sum[threadIdx.x].vd += partial_sum[threadIdx.x + s].vd;
 			partial_sum[threadIdx.x].wd += partial_sum[threadIdx.x + s].wd;
@@ -433,11 +388,8 @@ __global__ void wsum_reduction(Control *input, Control* output) {
 		__syncthreads();
 	}
 
-	// Let the thread 0 for this block write it's result to main memory
-	// Result is inexed by this block
 	if (threadIdx.x == 0) {
 		output[blockIdx.x] = partial_sum[0];
-		//printf("%4d::%.3f %.3f\n", blockIdx.x, output[blockIdx.x].vd, output[blockIdx.x].wd);
 	}
 }
 
@@ -455,21 +407,13 @@ __global__ void wsum_reduction_partial(Control* input, Control* output, int shif
 		weighted controls of the prediction horizon (sum along columns), can use var shift 
 		to shift the starting tid*/
 
-	// Allocate shared memory
 	__shared__ Control partial_sum[1024];
 
-	// Calculate thread ID
 	int tid = (threadIdx.x + shift) * gridDim.x + blockIdx.x;
-	//if (tid >1000) printf("%d\n", tid);
-	//if(threadIdx.x > 1000) printf("%d %d %d %d | %d\n", threadIdx.x , gridDim.x, blockDim.x, blockIdx.x, tid);
-	// Load elements into shared memory
 	partial_sum[threadIdx.x] = input[tid];
-	//if (blockIdx.x == 0 && threadIdx.x>1000) printf("%d %d\n", threadIdx.x, tid);
 	__syncthreads();
 
-	// Start at 1/2 block stride and divide by two each iteration
 	for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-		// Each thread does work unless it is further than the stride
 		if (threadIdx.x < s) {
 			partial_sum[threadIdx.x].vd += partial_sum[threadIdx.x + s].vd;
 			partial_sum[threadIdx.x].wd += partial_sum[threadIdx.x + s].wd;
@@ -477,12 +421,16 @@ __global__ void wsum_reduction_partial(Control* input, Control* output, int shif
 		__syncthreads();
 	}
 
-	// Let the thread 0 for this block write it's result to main memory
-	// Result is inexed by this block
 	if (threadIdx.x == 0) {
 		output[blockIdx.x] = partial_sum[0];
-		//printf("%4d::%.3f %.3f\n", blockIdx.x, output[blockIdx.x].vd, output[blockIdx.x].wd);
 	}
+}
+
+__global__ void printControl(Control* u) {
+	printf("%.3f %.3f\n", u[0].vd, u[0].wd);
+}
+__global__ void printMinCost(float* c) {
+	printf("min cost: %.3f\n", c[0]);
 }
 
 __host__ Pos getIntersec(Track line1, Track line2) {
@@ -498,7 +446,6 @@ __host__ void build_track(Track* inner_fcn, Track* outer_fcn, Pos* mid_intersec,
 	/*  Build the boundaries of a designated path, also return 
 		the intersection points of the middle path and boundaries*/
 	float mid_m[4] = { -mid_fcn[0].a, -mid_fcn[1].a, -mid_fcn[2].a, -mid_fcn[3].a };
-	//printf("slope: %.3f %.3f %.3f %.3f\n", mid_m[0], mid_m[1], mid_m[2], mid_m[3]);
 	
 	memcpy(outer_fcn, mid_fcn, 4 * sizeof(Track));
 	outer_fcn[0].c += (ROAD_WIDTH / 2) / cos(atan(mid_m[0]));
@@ -526,21 +473,6 @@ __host__ void build_track(Track* inner_fcn, Track* outer_fcn, Pos* mid_intersec,
 	outer_intersec[1] = getIntersec(outer_fcn[1], outer_fcn[2]);
 	outer_intersec[2] = getIntersec(outer_fcn[2], outer_fcn[3]);
 	outer_intersec[3] = getIntersec(outer_fcn[3], outer_fcn[0]);
-
-	//printf("inner0: %.3f %.3f %.3f\n", inner_fcn[0].b, inner_fcn[0].a, inner_fcn[0].c);
-	//printf("inner0: %.3f %.3f %.3f\n", inner_fcn[1].b, inner_fcn[1].a, inner_fcn[1].c);
-	//printf("inner0: %.3f %.3f %.3f\n", inner_fcn[2].b, inner_fcn[2].a, inner_fcn[2].c);
-	//printf("inner0: %.3f %.3f %.3f\n", inner_fcn[3].b, inner_fcn[3].a, inner_fcn[3].c);
-
-	//printf("mid itrsc0: %.3f %.3f\n", mid_intersec[0].x, mid_intersec[0].y);
-	//printf("mid itrsc0: %.3f %.3f\n", mid_intersec[1].x, mid_intersec[1].y);
-	//printf("mid itrsc0: %.3f %.3f\n", mid_intersec[2].x, mid_intersec[2].y);
-	//printf("mid itrsc0: %.3f %.3f\n", mid_intersec[3].x, mid_intersec[3].y);
-
-	//printf("out itrsc0: %.3f %.3f\n", outer_intersec[0].x, outer_intersec[0].y);
-	//printf("out itrsc0: %.3f %.3f\n", outer_intersec[1].x, outer_intersec[1].y);
-	//printf("out itrsc0: %.3f %.3f\n", outer_intersec[2].x, outer_intersec[2].y);
-	//printf("out itrsc0: %.3f %.3f\n", outer_intersec[3].x, outer_intersec[3].y);
 }
 
 int main() {
@@ -554,8 +486,10 @@ int main() {
 	Control* host_V, * dev_V;
 	Control output_u0;
 	float  host_u0[2] = { 2, 0 };
-	Control host_U[int(N_HRZ)], * dev_U;
-	State host_x0 = {150.91,126.71,-0.2,2,0};
+	Control* host_U, * dev_U;
+	/*State host_x0 = {150.91,126.71,-1,2};*/
+	State host_x0 = { 136, 138,-1,2 };
+	//State host_x0 = { 153.843, 120.072, -1.520, 2.726 };
 	State* dev_x0;
 	float  RAND_SCALAR = 2.0;
 	curandState* dev_cstate;
@@ -563,6 +497,7 @@ int main() {
 	State* dev_stateList, * host_stateList;
 	float* dev_state_costList;
 	float* dev_rollout_costList;
+	float* host_rollout_costList;
 	float* dev_rho;
 	float* dev_w_tilde;
 	float* dev_eta;
@@ -582,45 +517,41 @@ int main() {
 	Pos* dev_mid_intersec, * dev_in_intersec, * dev_out_intersec;
 	
 	// Setup host memory
-	host_V = (Control*)malloc(K * N_HRZ * sizeof(Control));
-	host_u_opt = (Control*)malloc(N_HRZ * sizeof(Control));
-	host_stateList = (State*)malloc(K*N_HRZ * sizeof(State));
+	host_V = (Control*)malloc(int(K * N_HRZ) * sizeof(Control));
+	host_u_opt = (Control*)malloc(int(N_HRZ) * sizeof(Control));
+	host_stateList = (State*)malloc(int(K * N_HRZ) * sizeof(State));
 	host_in_fcn = (Track*)malloc(4 * sizeof(Track));
 	host_out_fcn = (Track*)malloc(4 * sizeof(Track));
 	host_mid_intersec = (Pos*)malloc(4 * sizeof(Pos));
 	host_in_intersec = (Pos*)malloc(4 * sizeof(Pos));
 	host_out_intersec = (Pos*)malloc(4 * sizeof(Pos));
+	host_U = (Control*)malloc(int(N_HRZ) * sizeof(Control));
+	host_rollout_costList = (float*)malloc(int(K) * sizeof(float));
 	//host_U = (Control*)malloc(N_HRZ * sizeof(Control));
 
 	// Setup device memory
-	cudaMalloc((void**)&dev_cstate, K * N_HRZ * sizeof(curandState));
-	cudaMalloc((void**)&dev_V, K * N_HRZ * sizeof(Control));
+	cudaMalloc((void**)&dev_cstate, int(K * N_HRZ) * sizeof(curandState));
+	cudaMalloc((void**)&dev_V, int(K * N_HRZ) * sizeof(Control));
 	cudaMalloc((void**)&dev_x0, sizeof(State));
-	cudaMalloc((void**)&dev_stateList, K*N_HRZ * sizeof(State));
-	cudaMalloc((void**)&dev_state_costList, K * N_HRZ * sizeof(float));
-	cudaMalloc((void**)&dev_rollout_costList, K * sizeof(float));
+	cudaMalloc((void**)&dev_stateList, int(K * N_HRZ) * sizeof(State));
+	cudaMalloc((void**)&dev_state_costList, int(K * N_HRZ) * sizeof(float));
+	cudaMalloc((void**)&dev_rollout_costList, int(K) * sizeof(float));
 	cudaMalloc((void**)&dev_mid_fcn, 4 * sizeof(Track));
 	cudaMalloc((void**)&dev_in_fcn, 4 * sizeof(Track));
 	cudaMalloc((void**)&dev_out_fcn, 4 * sizeof(Track));
 	cudaMalloc((void**)&dev_mid_intersec, 4 * sizeof(Pos));
 	cudaMalloc((void**)&dev_in_intersec, 4 * sizeof(Pos));
 	cudaMalloc((void**)&dev_out_intersec, 4 * sizeof(Pos));
-	cudaMalloc((void**)&dev_rho, K * sizeof(float));
-	cudaMalloc((void**)&dev_w_tilde, K * sizeof(float));
-	cudaMalloc((void**)&dev_eta, K * sizeof(float));
-	cudaMalloc((void**)&dev_u_opt, N_HRZ * sizeof(Control));
-	cudaMalloc((void**)&dev_u_opt_part, N_HRZ * sizeof(Control));
-	cudaMalloc((void**)&dev_temp_u_opt, K * N_HRZ * sizeof(Control));
-	cudaMalloc((void**)&dev_U, N_HRZ * sizeof(Control));
+	cudaMalloc((void**)&dev_rho, int(K) * sizeof(float));
+	cudaMalloc((void**)&dev_w_tilde, int(K) * sizeof(float));
+	cudaMalloc((void**)&dev_eta, int(K) * sizeof(float));
+	cudaMalloc((void**)&dev_u_opt, int(N_HRZ) * sizeof(Control));
+	cudaMalloc((void**)&dev_u_opt_part, int(N_HRZ) * sizeof(Control));
+	cudaMalloc((void**)&dev_temp_u_opt, int(K * N_HRZ) * sizeof(Control));
+	cudaMalloc((void**)&dev_U, int(N_HRZ) * sizeof(Control));
 
 	// Setup constant memory
 	build_track(host_in_fcn, host_out_fcn, host_mid_intersec, host_in_intersec, host_out_intersec, host_mid_fcn);
-	//cudaMemcpyToSymbol(dev_mid_fcn, host_mid_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice);
-	//cudaMemcpyToSymbol(dev_in_fcn, host_in_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice);
-	//cudaMemcpyToSymbol(dev_out_fcn, host_out_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice);
-	//cudaMemcpyToSymbol(dev_mid_intersec, host_mid_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
-	//cudaMemcpyToSymbol(dev_in_intersec, host_in_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
-	//cudaMemcpyToSymbol(dev_out_intersec, host_out_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
 	cudaMemcpy(dev_mid_fcn, host_mid_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice);
 	cudaMemcpy(dev_in_fcn, host_in_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice);
 	cudaMemcpy(dev_out_fcn, host_out_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice);
@@ -635,59 +566,126 @@ int main() {
 	}
 	
 	std::fstream outputFile;
+	std::fstream testFile;
+	std::fstream cost;
+	std::fstream predFile;
 	// create a name for the file output
-	outputFile.open("MPC_output.csv", ios::out | ios::app);
+	outputFile.open("MPC_output4.csv", ios::out | ios::app);
+	testFile.open("testFile.csv", ios::out | ios::app);
+	cost.open("costroll.csv", ios::out | ios::app);
+	predFile.open("predstate.csv", ios::out | ios::app);
+	initCurand << <N_HRZ * 8, K / 8 >> > (dev_cstate, 0);
 
-	for (int it = 0; it < 10000; it++) {
+	for (double it = 0; it < 30; it++) {
 
-		cudaMemcpy(dev_U, &host_U, N_HRZ * sizeof(Control), cudaMemcpyHostToDevice);
+		cudaMemcpy(dev_U, host_U, int(N_HRZ) * sizeof(Control), cudaMemcpyHostToDevice);
 		cudaMemcpy(dev_x0, &host_x0, sizeof(State), cudaMemcpyHostToDevice);
 
 		// Launch kernal functions
 		//cudaEventRecord(start, 0);
 
-		initCurand << <N_HRZ * 8, K / 8 >> > (dev_cstate, 1);  // Slow! might not want it in loop?
-		cudaEventRecord(start, 0);
-
+		/*initCurand << <N_HRZ * 8, K / 8 >> > (dev_cstate, 0);*/// (long)it);  // Slow! might not want it in loop?
+		//cudaEventRecord(start, 0);
+		//printControl << <1, 1 >> > (dev_U);
 		genControl << <K, N_HRZ >> > (dev_cstate, dev_V, dev_U, RAND_SCALAR);  // WRONG! shoud take in a sequence of controls and not a single u
 
 		genState << <K / 256, K / 4 >> > (dev_stateList, dev_x0, dev_V);
 
 		costFcn << <N_HRZ * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn);
 
-		calcRolloutCost << <K, N_HRZ >> > (dev_state_costList, dev_rollout_costList);
+		calcRolloutCost2 << <K, N_HRZ >> > (dev_state_costList, dev_rollout_costList);
 
 		min_reduction << <K / 32 / 2, K / 32 >> > (dev_rollout_costList, dev_rho);
 		//line << <1, 1 >> > ();
-		//printfloat << <1, 32 >> > (dev_rho);
+		//printfloat << <1, 1 >> > (dev_rho);
 		min_reduction2 << <1, K / 32 >> > (dev_rho, dev_rho);
-
+		printMinCost << <1, 1 >> > (dev_rho);
 		calcWTilde << <K / 32, K / 32 >> > (dev_w_tilde, dev_rho, dev_rollout_costList);
 
 		sum_reduction << <K / 32 / 2, K / 32 >> > (dev_w_tilde, dev_eta);
+		//line << <1, 1 >> > ();
 		sum_reduction << <1, K / 32 >> > (dev_eta, dev_eta);//size
 
-		genW << <K, N_HRZ >> > (dev_temp_u_opt, dev_eta, dev_w_tilde, dev_V);
+		//printfloat << <1, 1 >> > (dev_eta);
+		genW << <K, int(N_HRZ) >> > (dev_temp_u_opt, dev_eta, dev_w_tilde, dev_V);
 		wsum_reduction << <N_HRZ, K >> > (dev_temp_u_opt, dev_u_opt);
-
+		//line << <1, 1 >> > ();
 		// If 1024 threads are too much for the hardware, the method below can be adapted
 
 		//wsum_reduction_partial << <40, 512 >> > (dev_temp_u_opt, dev_u_opt, 0);
 		//wsum_reduction_partial << <40, 512 >> > (dev_temp_u_opt, dev_u_opt_part, 512);
 		//sumControl << <20, 20 >> > (dev_u_opt_part, dev_u_opt);
-		cudaEventRecord(stop, 0);
 
-		// Show runtime in miliseconds
-		cudaEventSynchronize(stop);
-		cudaEventElapsedTime(&time, start, stop);
-		//printf("kernal runtime: %.5f ms\n", time);
-		cudaEventDestroy(start);
-		cudaEventDestroy(stop);
+		//cudaEventRecord(stop, 0);
+
+		//// Show runtime in miliseconds
+		//cudaEventSynchronize(stop);
+		//cudaEventElapsedTime(&time, start, stop);
+		////printf("kernal runtime: %.5f ms\n", time);
+		//cudaEventDestroy(start);
+		//cudaEventDestroy(stop);
 
 		// Acts as a syncing buffer so no need for additional synhronization
-		cudaMemcpy(host_V, dev_V, K * N_HRZ * sizeof(Control), cudaMemcpyDeviceToHost);
-		cudaMemcpy(host_stateList, dev_stateList, K * N_HRZ * sizeof(State), cudaMemcpyDeviceToHost);
-		cudaMemcpy(host_u_opt, dev_u_opt, N_HRZ * sizeof(Control), cudaMemcpyDeviceToHost);
+		cudaMemcpy(host_V, dev_V, int(K * N_HRZ) * sizeof(Control), cudaMemcpyDeviceToHost);
+		cudaMemcpy(host_stateList, dev_stateList, int(K * N_HRZ) * sizeof(State), cudaMemcpyDeviceToHost);
+		cudaMemcpy(host_u_opt, dev_u_opt, int(N_HRZ) * sizeof(Control), cudaMemcpyDeviceToHost);
+		cudaMemcpy(host_rollout_costList, dev_rollout_costList, int(K) * sizeof(float), cudaMemcpyDeviceToHost);
+		
+		
+		for (int j = 0; j < 40 * 1024; j++) {
+			testFile << host_stateList[j].x << ",";
+		}
+		testFile << std::endl;
+		for (int j = 0; j < 40 * 1024; j++) {
+			testFile << host_stateList[j].y << ",";
+		}
+		testFile << std::endl;
+		for (int j = 0; j < 40 * 1024; j++) {
+			testFile << host_stateList[j].phi << ",";
+		}
+		testFile << std::endl;
+		for (int j = 0; j < 40 * 1024; j++) {
+			testFile << host_stateList[j].v0 << ",";
+		}
+		testFile << std::endl;
+
+		for (int j = 0; j < 1024; j++) {
+			cost << host_rollout_costList[j] << std::endl;
+		}
+
+		State predstate[40];
+		predstate[0] = host_x0;
+		for (int i = 0; i < N_HRZ; i++) {
+			int count = i - 1;
+			if (count < 0) count = 0;
+			predstate[i] = bicycleModel(predstate[count], host_u_opt[i]);
+		}
+
+		for (int j = 0; j < 40 ; j++) {
+			predFile << predstate[j].x << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40 ; j++) {
+			predFile << predstate[j].y << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40 ; j++) {
+			predFile << predstate[j].phi << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40 ; j++) {
+			predFile << predstate[j].v0 << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40; j++) {
+			predFile << host_u_opt[j].vd << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40; j++) {
+			predFile << host_u_opt[j].wd << ",";
+		}
+		predFile << std::endl;
+		
 
 		//printf("returned random value is %.1f %.1f %.1f\n", host_V[0].vd, host_V[1].vd, host_V[2].wd);
 		//printf("returned state list value is %.1f %.1f %.1f %.1f\n", host_stateList[1].x, host_stateList[1].y, host_stateList[1].phi, host_stateList[1].v0);
@@ -704,18 +702,22 @@ int main() {
 
 		// Might want to write the rollout states to a csv file?
 
+
 		// Generate the predicted next state with u_opt
+		//printf("orig: %.3f %.3f\n", host_x0.x, host_x0.y);
 		host_x0 = bicycleModel(host_x0, host_u_opt[0]);
-		//printf("%.3f, %.3f, %.3f, %.3f, %.3f, %.3f\n", host_x0.x, host_x0.y, host_x0.phi, host_x0.v0, host_u_opt[0].vd, host_u_opt[0].wd);
-		outputFile << it << "," << host_x0.x << "," << host_x0.y << "," << host_x0.phi << "," << host_x0.v0 << "," << host_u_opt[0].vd << "," << host_u_opt[0].wd << std::endl;
+		printf("%.3f, %.3f, %.3f, %.3f, %.3f, %.3f\n", host_x0.x, host_x0.y, host_x0.phi, host_x0.v0, host_u_opt[0].vd, host_u_opt[0].wd);
+		//outputFile << it << "," << host_x0.x << "," << host_x0.y << "," << host_x0.phi << "," << host_x0.v0 << "," << host_u_opt[0].vd << "," << host_u_opt[0].wd << std::endl;
 		//printf("%.3f, %.3f, %.3f, %.3f\n", host_x0.x, host_x0.y, host_x0.phi, host_x0.v0);
 		// Shift the control by 1 
+
 		output_u0 = host_u_opt[0];
-		memmove(host_u_opt, &host_u_opt[1], (N_HRZ - 1) * sizeof(Control)); // use memmove instead of memcpy because the destination overlaps the source
+		memmove(host_u_opt, &host_u_opt[1], int(N_HRZ - 1) * sizeof(Control)); // use memmove instead of memcpy because the destination overlaps the source
 		host_u_opt[int(N_HRZ)] = host_u_opt[int(N_HRZ) - 1];
-		memcpy(host_U, host_u_opt, N_HRZ * sizeof(Control));
+		memcpy(host_U, host_u_opt, int(N_HRZ) * sizeof(Control));
 	}
 	outputFile.close();
-	
+	testFile.close();
+	cost.close();
 	return 0;
 }
