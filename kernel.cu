@@ -55,8 +55,11 @@ struct Obs {
 };
 
 __global__ void sum_reduction(float* v, float* v_r) {
-	__shared__ float partial_sum[64];
+	/*  Perform sum reduction to an array of floats (here since the for
+		loop iterates with a division of 2, the blockDim (#of threads) 
+		must be 2 to the nth power) !!Important!! */
 
+	__shared__ float partial_sum[64];
 
 	int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
 
@@ -155,7 +158,7 @@ __device__ float distanceFromTrack(float inner_f, float inner_g, float inner_h,
 }
 
 __device__ float calculateCost(State* state, Track* outer_fcn, Track* inner_fcn) {
-	/*  Calculate the cost of a current state (obstacle collision part not added yet)*/
+	/*  Calculate the cost of a current state (obstacle collision part added)*/
 
 	float state_cost = 0.0f;
 	float outer_f = outer_fcn[0].b * state->y + outer_fcn[0].a * state->x + outer_fcn[0].c;
@@ -178,6 +181,18 @@ __device__ float calculateCost(State* state, Track* outer_fcn, Track* inner_fcn)
 	}
 	state_cost += distance / (ROAD_WIDTH / 2) * TRACK_ERR_COST;
 	return state_cost;
+}
+
+__device__ float obstacleCollision(State* state, Obs* obstacle) {
+	/*  Calculate the relative distace from the middle of the obstacle 
+		(if output == 0, no collision)*/
+
+	float output = 0.0, obs_fcn = 0.0;
+	obs_fcn = powf(state->x - obstacle->x, 2) + powf(state->y - obstacle->y, 2) - powf(obstacle->r, 2);
+	if (obs_fcn < 0) {
+		output = -obs_fcn / obstacle->r;
+	}
+	return output;
 }
 
 __global__ void initCurand(curandState* state, unsigned long seed) {
@@ -231,7 +246,7 @@ __global__ void genState(State* state_list, State* init_state, Control* pert_con
 }  
 
 __global__ void costFcn(float* cost_list, State* state_list,  
-	Track* outer_fcn, Track* inner_fcn) {
+	Track* outer_fcn, Track* inner_fcn, Obs* obstacle) {
 	/*  Calculate all the state costs in the prediction horizon 
 		for each rollout k */
 
@@ -239,6 +254,7 @@ __global__ void costFcn(float* cost_list, State* state_list,
 	float state_cost = 0.0f;
 	State state = state_list[idx];
 
+	// Tracking penatlty
 	float outer_f = outer_fcn[0].b * state.y + outer_fcn[0].a * state.x + outer_fcn[0].c;  
 	float outer_g = outer_fcn[1].b * state.y + outer_fcn[1].a * state.x + outer_fcn[1].c;
 	float outer_h = outer_fcn[2].b * state.y + outer_fcn[2].a * state.x + outer_fcn[2].c;
@@ -249,6 +265,7 @@ __global__ void costFcn(float* cost_list, State* state_list,
 	float inner_h = inner_fcn[2].b * state.y + inner_fcn[2].a * state.x + inner_fcn[2].c;
 	float inner_i = inner_fcn[3].b * state.y + inner_fcn[3].a * state.x + inner_fcn[3].c;
 	float distance = distanceFromTrack(inner_f, inner_g, inner_h, inner_i, inner_fcn);
+
 	if ((outer_f > 0 && outer_g < 0 && outer_h < 0 && outer_i>0) && 
 		!(inner_f > 0 && inner_g < 0 && inner_h < 0 && inner_i > 0)) {
 		state_cost += 0;
@@ -257,6 +274,14 @@ __global__ void costFcn(float* cost_list, State* state_list,
 		state_cost += OFF_ROAD_COST;
 	}
 	state_cost += distance / (ROAD_WIDTH / 2) * TRACK_ERR_COST;
+
+	// Obstacle avoidance penalty
+
+	float collision = 0.0;
+	for (int i = 0; obstacle[i].x != NULL; i++) {
+		collision = fabs(obstacleCollision(&state, &obstacle[i]));
+		state_cost += collision * COLLISION_COST;
+	}
 	cost_list[idx] = state_cost;
 }
 
@@ -492,9 +517,9 @@ int main() {
 	Control output_u0;
 	float  host_u0[2] = { 2, 0 };
 	Control* host_U, * dev_U;
-	//State host_x0 = {150.91,126.71,-1,2};
+	State host_x0 = {150.91,126.71,-1,2};
 	//State host_x0 = { 136, 138,-1,2 };
-	State host_x0 = {7,31.5, 2.5, 2.726 };
+	//State host_x0 = {7,31.5, 2.5, 2.726 };
 	State* dev_x0;
 	curandState* dev_cstate;
 
@@ -509,13 +534,14 @@ int main() {
 	Control* dev_temp_u_opt;
 
 	//Build obstacle
-	Obs obstacle[] = {
+	Obs host_obstacle[] = {
 		{154 ,126.2 ,1},
 		{153 ,124.5 ,1},
 		{152 ,120.5 ,1},
 		{152 ,119   ,1}
 	};
-	int NUM_OBS = sizeof(obstacle) / sizeof(Obs);
+	int NUM_OBS = sizeof(host_obstacle) / sizeof(Obs);
+	Obs* dev_obstacle;
 
 	// Build track
 	Track host_mid_fcn[] = { 
@@ -540,7 +566,6 @@ int main() {
 	host_out_intersec = (Pos*)malloc(4 * sizeof(Pos));
 	host_U = (Control*)malloc(int(N_HRZ) * sizeof(Control));
 	host_rollout_costList = (float*)malloc(int(K) * sizeof(float));
-	//host_U = (Control*)malloc(N_HRZ * sizeof(Control));
 
 	// Setup device memory
 	cudaMalloc((void**)&dev_cstate, int(K * N_HRZ) * sizeof(curandState));
@@ -562,6 +587,7 @@ int main() {
 	cudaMalloc((void**)&dev_u_opt_part, int(N_HRZ) * sizeof(Control));
 	cudaMalloc((void**)&dev_temp_u_opt, int(K * N_HRZ) * sizeof(Control));
 	cudaMalloc((void**)&dev_U, int(N_HRZ) * sizeof(Control));
+	cudaMalloc((void**)&dev_obstacle, NUM_OBS * sizeof(Obs));
 
 	// Setup constant memory
 	build_track(host_in_fcn, host_out_fcn, host_mid_intersec, host_in_intersec, host_out_intersec, host_mid_fcn);
@@ -571,19 +597,21 @@ int main() {
 	cudaMemcpy(dev_mid_intersec, host_mid_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
 	cudaMemcpy(dev_in_intersec, host_in_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
 	cudaMemcpy(dev_out_intersec, host_out_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
+	cudaMemcpy(dev_obstacle, host_obstacle, NUM_OBS * sizeof(Obs), cudaMemcpyHostToDevice);
 
 	// Initialize nominal conrtrol
 	for (int n = 0; n < N_HRZ; n++) {
-		host_U[n].vd = host_u0[0];
-		host_U[n].wd = host_u0[1];
-		//host_U[n].vd = 0;
-		//host_U[n].wd = 0;
+		//host_U[n].vd = host_u0[0];
+		//host_U[n].wd = host_u0[1];
+		host_U[n].vd = 0;
+		host_U[n].wd = 0;
 	}
 	
 	std::fstream outputFile;
 	std::fstream testFile;
 	std::fstream cost;
 	std::fstream predFile;
+
 	// create a name for the file output
 	outputFile.open("MPC_output4.csv", ios::out | ios::app);
 	testFile.open("testFile.csv", ios::out | ios::app);
@@ -606,7 +634,7 @@ int main() {
 
 		genState << <K / 256, K / 4 >> > (dev_stateList, dev_x0, dev_V);
 
-		costFcn << <N_HRZ * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn);
+		costFcn << <N_HRZ * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn, dev_obstacle);
 
 		calcRolloutCost2 << <K, N_HRZ >> > (dev_state_costList, dev_rollout_costList);
 
@@ -667,38 +695,38 @@ int main() {
 		//	cost << host_rollout_costList[j] << std::endl;
 		//}
 
-		//// Store the weighted control sequence and its predicted states to a csv file
-		//State predstate[40];
-		//predstate[0] = host_x0;
-		//for (int i = 0; i < N_HRZ; i++) {
-		//	int count = i - 1;
-		//	if (count < 0) count = 0;
-		//	predstate[i] = bicycleModel(predstate[count], host_u_opt[i]);
-		//}
-		//for (int j = 0; j < 40 ; j++) {
-		//	predFile << predstate[j].x << ",";
-		//}
-		//predFile << std::endl;
-		//for (int j = 0; j < 40 ; j++) {
-		//	predFile << predstate[j].y << ",";
-		//}
-		//predFile << std::endl;
-		//for (int j = 0; j < 40 ; j++) {
-		//	predFile << predstate[j].phi << ",";
-		//}
-		//predFile << std::endl;
-		//for (int j = 0; j < 40 ; j++) {
-		//	predFile << predstate[j].v0 << ",";
-		//}
-		//predFile << std::endl;
-		//for (int j = 0; j < 40; j++) {
-		//	predFile << host_u_opt[j].vd << ",";
-		//}
-		//predFile << std::endl;
-		//for (int j = 0; j < 40; j++) {
-		//	predFile << host_u_opt[j].wd << ",";
-		//}
-		//predFile << std::endl;
+		// Store the weighted control sequence and its predicted states to a csv file
+		State predstate[40];
+		predstate[0] = host_x0;
+		for (int i = 0; i < N_HRZ; i++) {
+			int count = i - 1;
+			if (count < 0) count = 0;
+			predstate[i] = bicycleModel(predstate[count], host_u_opt[i]);
+		}
+		for (int j = 0; j < 40 ; j++) {
+			predFile << predstate[j].x << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40 ; j++) {
+			predFile << predstate[j].y << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40 ; j++) {
+			predFile << predstate[j].phi << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40 ; j++) {
+			predFile << predstate[j].v0 << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40; j++) {
+			predFile << host_u_opt[j].vd << ",";
+		}
+		predFile << std::endl;
+		for (int j = 0; j < 40; j++) {
+			predFile << host_u_opt[j].wd << ",";
+		}
+		predFile << std::endl;
 		
 		//// Not really important here
 		//printf("returned random value is %.1f %.1f %.1f\n", host_V[0].vd, host_V[1].vd, host_V[2].wd);
@@ -713,8 +741,6 @@ int main() {
 		//	printf("%2.2f ", host_u_opt[i].wd);
 		//}
 		//printf("\n");
-
-		// Might want to write the rollout states to a csv file?
 
 
 		// Generate the predicted next state with u_opt
