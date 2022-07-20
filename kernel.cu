@@ -9,6 +9,7 @@
 #include <math.h>
 #include <curand_kernel.h>
 #include <curand.h>
+#include <chrono>
 
 using namespace std;
 
@@ -78,10 +79,6 @@ __global__ void sum_reduction(float* v, float* v_r) {
 		//printf("result2: %.3f\n", partial_sum[0]);
 		//printf("%4d::%.3f\n", blockIdx.x, v_r[blockIdx.x]);
 	}
-}
-
-__global__ void printVar(float* var) {
-	printf("====%.3f====", var[0]);
 }
 
 __host__ __device__ State bicycleModel(State state, Control u) {
@@ -329,14 +326,6 @@ __global__ void calcRolloutCost2(float* input, float* output) {
 		output[blockIdx.x] = partial_sum[0];
 	}
 }
-__global__ void line() {
-	printf("=====================\n");
-}
-
-__global__ void printfloat(float* f) {
-	int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
-	printf("float: %.3f\n", f[i]);
-}
 
 __global__ void min_reduction(float* input, float* output) {
 	/*  Find the rollout with the minimum cost using sum reduction methods, 
@@ -463,6 +452,15 @@ __global__ void printMinCost(float* c) {
 	printf("min cost: %.3f\n", c[0]);
 }
 
+__global__ void line() {
+	printf("=====================\n");
+}
+
+__global__ void printfloat(float* f) {
+	int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
+	printf("float: %.3f\n", f[i]);
+}
+
 __host__ Pos getIntersec(Track line1, Track line2) {
 	/*  Calculate the intersection point of two line fcns*/
 	Pos intersec;
@@ -514,25 +512,23 @@ int main() {
 
 	// Setup parameters and Initialize variables
 	Control* host_V, * dev_V;
-	Control output_u0;
-	float  host_u0[2] = { 2, 0 };
 	Control* host_U, * dev_U;
+	Control output_u0;
+	Control* dev_u_opt, * dev_u_opt_part, * host_u_opt;
+	Control* dev_temp_u_opt;
 	State host_x0 = {150.91,126.71,-1,2};
 	//State host_x0 = { 136, 138,-1,2 };
 	//State host_x0 = {7,31.5, 2.5, 2.726 };
 	State* dev_x0;
-	curandState* dev_cstate;
-
 	State* dev_stateList, * host_stateList;
+	curandState* dev_cstate;
 	float* dev_state_costList;
 	float* dev_rollout_costList;
 	float* host_rollout_costList;
 	float* dev_rho;
 	float* dev_w_tilde;
 	float* dev_eta;
-	Control* dev_u_opt, * dev_u_opt_part, * host_u_opt;
-	Control* dev_temp_u_opt;
-
+	
 	//Build obstacle
 	Obs host_obstacle[] = {
 		{154 ,126.2 ,1},
@@ -540,8 +536,8 @@ int main() {
 		{152 ,120.5 ,1},
 		{152 ,119   ,1}
 	};
-	int NUM_OBS = sizeof(host_obstacle) / sizeof(Obs);
 	Obs* dev_obstacle;
+	int NUM_OBS = sizeof(host_obstacle) / sizeof(Obs);
 
 	// Build track
 	Track host_mid_fcn[] = { 
@@ -607,6 +603,7 @@ int main() {
 		host_U[n].wd = 0;
 	}
 	
+	// Output .csv files
 	std::fstream outputFile;
 	std::fstream testFile;
 	std::fstream cost;
@@ -617,9 +614,18 @@ int main() {
 	testFile.open("testFile.csv", ios::out | ios::app);
 	cost.open("costroll.csv", ios::out | ios::app);
 	predFile.open("predstate.csv", ios::out | ios::app);
+
+	// Initialize random seed outside loop (will generate same random numbers but greatly increase efficiency)
 	initCurand << <N_HRZ * 8, K / 8 >> > (dev_cstate, 0);
 
-	for (double it = 0; it < 4000; it++) {
+	// Calculate average runtime 
+	#define ITERATIONS 4500
+	double runtime_avg = 0;
+	double runtime_list[ITERATIONS] = { 0 };
+
+	// Start actual MPC iteration
+	for (int it = 0; it < ITERATIONS; it++) {
+		auto start = chrono::steady_clock::now();
 
 		cudaMemcpy(dev_U, host_U, int(N_HRZ) * sizeof(Control), cudaMemcpyHostToDevice);
 		cudaMemcpy(dev_x0, &host_x0, sizeof(State), cudaMemcpyHostToDevice);
@@ -628,7 +634,7 @@ int main() {
 		//cudaEventRecord(start, 0);
 
 		/*initCurand << <N_HRZ * 8, K / 8 >> > (dev_cstate, 0);*/// (long)it);  // Slow! might not want it in loop?
-		cudaEventRecord(start, 0);
+		//cudaEventRecord(start, 0);
 
 		genControl << <K, N_HRZ >> > (dev_cstate, dev_V, dev_U, RAND_SCALAR);  
 
@@ -641,7 +647,7 @@ int main() {
 		min_reduction << <K / 32 / 2, K / 32 >> > (dev_rollout_costList, dev_rho);
 		min_reduction2 << <1, K / 32 >> > (dev_rho, dev_rho);
 
-		printMinCost << <1, 1 >> > (dev_rho);
+		//printMinCost << <1, 1 >> > (dev_rho);
 
 		calcWTilde << <K / 32, K / 32 >> > (dev_w_tilde, dev_rho, dev_rollout_costList);
 
@@ -650,6 +656,7 @@ int main() {
 		sum_reduction << <1, K / 32 >> > (dev_eta, dev_eta);
 
 		genW << <K, int(N_HRZ) >> > (dev_temp_u_opt, dev_eta, dev_w_tilde, dev_V);
+
 		wsum_reduction << <N_HRZ, K >> > (dev_temp_u_opt, dev_u_opt);
 
 		// If 1024 threads are too much for the hardware, the method below can be adapted
@@ -657,14 +664,14 @@ int main() {
 		//wsum_reduction_partial << <40, 512 >> > (dev_temp_u_opt, dev_u_opt_part, 512);
 		//sumControl << <20, 20 >> > (dev_u_opt_part, dev_u_opt);
 
-		cudaEventRecord(stop, 0);
+		//cudaEventRecord(stop, 0);
 
-		// Show runtime in miliseconds
-		cudaEventSynchronize(stop);
-		cudaEventElapsedTime(&time, start, stop);
-		printf("kernal runtime: %.5f ms\n", time);
-		cudaEventDestroy(start);
-		cudaEventDestroy(stop);
+		//// Show runtime in miliseconds
+		//cudaEventSynchronize(stop);
+		//cudaEventElapsedTime(&time, start, stop);
+		//printf("kernal runtime: %.5f ms\n", time);
+		//cudaEventDestroy(start);
+		//cudaEventDestroy(stop);
 
 		// Acts as a syncing buffer so no need for additional synhronization
 		cudaMemcpy(host_V, dev_V, int(K * N_HRZ) * sizeof(Control), cudaMemcpyDeviceToHost);
@@ -695,38 +702,38 @@ int main() {
 		//	cost << host_rollout_costList[j] << std::endl;
 		//}
 
-		// Store the weighted control sequence and its predicted states to a csv file
-		State predstate[40];
-		predstate[0] = host_x0;
-		for (int i = 0; i < N_HRZ; i++) {
-			int count = i - 1;
-			if (count < 0) count = 0;
-			predstate[i] = bicycleModel(predstate[count], host_u_opt[i]);
-		}
-		for (int j = 0; j < 40 ; j++) {
-			predFile << predstate[j].x << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40 ; j++) {
-			predFile << predstate[j].y << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40 ; j++) {
-			predFile << predstate[j].phi << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40 ; j++) {
-			predFile << predstate[j].v0 << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40; j++) {
-			predFile << host_u_opt[j].vd << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40; j++) {
-			predFile << host_u_opt[j].wd << ",";
-		}
-		predFile << std::endl;
+		//// Store the weighted control sequence and its predicted states to a csv file
+		//State predstate[40];
+		//predstate[0] = host_x0;
+		//for (int i = 0; i < N_HRZ; i++) {
+		//	int count = i - 1;
+		//	if (count < 0) count = 0;
+		//	predstate[i] = bicycleModel(predstate[count], host_u_opt[i]);
+		//}
+		//for (int j = 0; j < 40 ; j++) {
+		//	predFile << predstate[j].x << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40 ; j++) {
+		//	predFile << predstate[j].y << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40 ; j++) {
+		//	predFile << predstate[j].phi << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40 ; j++) {
+		//	predFile << predstate[j].v0 << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40; j++) {
+		//	predFile << host_u_opt[j].vd << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40; j++) {
+		//	predFile << host_u_opt[j].wd << ",";
+		//}
+		//predFile << std::endl;
 		
 		//// Not really important here
 		//printf("returned random value is %.1f %.1f %.1f\n", host_V[0].vd, host_V[1].vd, host_V[2].wd);
@@ -747,7 +754,7 @@ int main() {
 		host_x0 = bicycleModel(host_x0, host_u_opt[0]);
 
 		// Store state data to csv and see results by plotting data in excel
-		printf("%.3f, %.3f, %.3f, %.3f, %.3f, %.3f\n", host_x0.x, host_x0.y, host_x0.phi, host_x0.v0, host_u_opt[0].vd, host_u_opt[0].wd);
+		//printf("%.3f, %.3f, %.3f, %.3f, %.3f, %.3f\n", host_x0.x, host_x0.y, host_x0.phi, host_x0.v0, host_u_opt[0].vd, host_u_opt[0].wd);
 		//outputFile << it << "," << host_x0.x << "," << host_x0.y << "," << host_x0.phi << "," << host_x0.v0 << "," << host_u_opt[0].vd << "," << host_u_opt[0].wd << std::endl;
 
 		// Shift the control by 1 
@@ -755,7 +762,22 @@ int main() {
 		memmove(host_u_opt, &host_u_opt[1], int(N_HRZ - 1) * sizeof(Control)); // use memmove instead of memcpy because the destination overlaps the source
 		host_u_opt[int(N_HRZ)] = host_u_opt[int(N_HRZ) - 1];
 		memcpy(host_U, host_u_opt, int(N_HRZ) * sizeof(Control));
+
+		// Record the time of one oteration
+		auto end = chrono::steady_clock::now();
+		auto diff = end - start;
+		cout << chrono::duration <double, milli>(diff).count() << " ms" << endl;
+		runtime_list[it] = chrono::duration <double, milli>(diff).count();
 	}
+
+	// Average the runtime over all the iterations
+	for (int i = 0; i < ITERATIONS; i++) {
+		runtime_avg += runtime_list[i];
+	}
+	runtime_avg /= double(ITERATIONS);
+	cout << "AVG Runtime: " << runtime_avg << " (ms)" << endl;
+
+	// Close cvs files after record
 	outputFile.close();
 	testFile.close();
 	cost.close();
