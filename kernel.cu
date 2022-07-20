@@ -26,10 +26,11 @@ using namespace std;
 #define K			1024            // K-rollout predictions
 #define V_MAX       4.0f			// Velocity command upper-bound
 #define V_MIN       1.5f			// Velocity command lower-bound
-#define W_MAX		1.0f			// Angular acceleration command upper-bound
-#define W_MIN		-1.0f			// Angular acceleration command lower-bound
+#define W_MAX		1.5f			// Angular acceleration command upper-bound
+#define W_MIN		-1.5f			// Angular acceleration command lower-bound
 #define ROAD_WIDTH  2.0f			// Width of road (unit: m)
-#define LAMBDA      300.0f
+#define LAMBDA      100.0f
+#define RAND_SCALAR 3.0f
 
 #define OFF_ROAD_COST	500.0f		// Penalty for leaving the road
 #define COLLISION_COST	800.0f		// Penalty for colliding into an obstacle
@@ -47,6 +48,10 @@ struct Track {
 };
 struct Pos {
 	float x, y;
+};
+
+struct Obs {
+	float x, y, r;
 };
 
 __global__ void sum_reduction(float* v, float* v_r) {
@@ -143,7 +148,7 @@ __device__ float distanceFromTrack(float inner_f, float inner_g, float inner_h,
 		distance = inner_min - 0.5 * ROAD_WIDTH;
 	}
 	if (distance > ROAD_WIDTH / 2) {
-		distance = 0;
+		distance = 2; // Important to set it to 2 instead of 0 to ensure the vehicle tracks the designated path
 	}
 
 	return distance;
@@ -245,7 +250,7 @@ __global__ void costFcn(float* cost_list, State* state_list,
 	float inner_i = inner_fcn[3].b * state.y + inner_fcn[3].a * state.x + inner_fcn[3].c;
 	float distance = distanceFromTrack(inner_f, inner_g, inner_h, inner_i, inner_fcn);
 	if ((outer_f > 0 && outer_g < 0 && outer_h < 0 && outer_i>0) && 
-		!(inner_f>0 && inner_g<0 && inner_h<0 && inner_i>0)) {
+		!(inner_f > 0 && inner_g < 0 && inner_h < 0 && inner_i > 0)) {
 		state_cost += 0;
 	}
 	else {
@@ -487,11 +492,10 @@ int main() {
 	Control output_u0;
 	float  host_u0[2] = { 2, 0 };
 	Control* host_U, * dev_U;
-	/*State host_x0 = {150.91,126.71,-1,2};*/
-	State host_x0 = { 136, 138,-1,2 };
-	//State host_x0 = { 153.843, 120.072, -1.520, 2.726 };
+	//State host_x0 = {150.91,126.71,-1,2};
+	//State host_x0 = { 136, 138,-1,2 };
+	State host_x0 = {7,31.5, 2.5, 2.726 };
 	State* dev_x0;
-	float  RAND_SCALAR = 2.0;
 	curandState* dev_cstate;
 
 	State* dev_stateList, * host_stateList;
@@ -504,8 +508,17 @@ int main() {
 	Control* dev_u_opt, * dev_u_opt_part, * host_u_opt;
 	Control* dev_temp_u_opt;
 
+	//Build obstacle
+	Obs obstacle[] = {
+		{154 ,126.2 ,1},
+		{153 ,124.5 ,1},
+		{152 ,120.5 ,1},
+		{152 ,119   ,1}
+	};
+	int NUM_OBS = sizeof(obstacle) / sizeof(Obs);
+
 	// Build track
-	Track host_mid_fcn[4] = { 
+	Track host_mid_fcn[] = { 
 		{1.0000, -1.33200, 82.62978},
 		{1.0000, 0.75640, -240.86623},
 		{1.0000, -1.36070, -33.13473},
@@ -563,6 +576,8 @@ int main() {
 	for (int n = 0; n < N_HRZ; n++) {
 		host_U[n].vd = host_u0[0];
 		host_U[n].wd = host_u0[1];
+		//host_U[n].vd = 0;
+		//host_U[n].wd = 0;
 	}
 	
 	std::fstream outputFile;
@@ -576,7 +591,7 @@ int main() {
 	predFile.open("predstate.csv", ios::out | ios::app);
 	initCurand << <N_HRZ * 8, K / 8 >> > (dev_cstate, 0);
 
-	for (double it = 0; it < 30; it++) {
+	for (double it = 0; it < 4000; it++) {
 
 		cudaMemcpy(dev_U, host_U, int(N_HRZ) * sizeof(Control), cudaMemcpyHostToDevice);
 		cudaMemcpy(dev_x0, &host_x0, sizeof(State), cudaMemcpyHostToDevice);
@@ -585,9 +600,9 @@ int main() {
 		//cudaEventRecord(start, 0);
 
 		/*initCurand << <N_HRZ * 8, K / 8 >> > (dev_cstate, 0);*/// (long)it);  // Slow! might not want it in loop?
-		//cudaEventRecord(start, 0);
-		//printControl << <1, 1 >> > (dev_U);
-		genControl << <K, N_HRZ >> > (dev_cstate, dev_V, dev_U, RAND_SCALAR);  // WRONG! shoud take in a sequence of controls and not a single u
+		cudaEventRecord(start, 0);
+
+		genControl << <K, N_HRZ >> > (dev_cstate, dev_V, dev_U, RAND_SCALAR);  
 
 		genState << <K / 256, K / 4 >> > (dev_stateList, dev_x0, dev_V);
 
@@ -596,34 +611,32 @@ int main() {
 		calcRolloutCost2 << <K, N_HRZ >> > (dev_state_costList, dev_rollout_costList);
 
 		min_reduction << <K / 32 / 2, K / 32 >> > (dev_rollout_costList, dev_rho);
-		//line << <1, 1 >> > ();
-		//printfloat << <1, 1 >> > (dev_rho);
 		min_reduction2 << <1, K / 32 >> > (dev_rho, dev_rho);
+
 		printMinCost << <1, 1 >> > (dev_rho);
+
 		calcWTilde << <K / 32, K / 32 >> > (dev_w_tilde, dev_rho, dev_rollout_costList);
 
 		sum_reduction << <K / 32 / 2, K / 32 >> > (dev_w_tilde, dev_eta);
-		//line << <1, 1 >> > ();
-		sum_reduction << <1, K / 32 >> > (dev_eta, dev_eta);//size
 
-		//printfloat << <1, 1 >> > (dev_eta);
+		sum_reduction << <1, K / 32 >> > (dev_eta, dev_eta);
+
 		genW << <K, int(N_HRZ) >> > (dev_temp_u_opt, dev_eta, dev_w_tilde, dev_V);
 		wsum_reduction << <N_HRZ, K >> > (dev_temp_u_opt, dev_u_opt);
-		//line << <1, 1 >> > ();
-		// If 1024 threads are too much for the hardware, the method below can be adapted
 
+		// If 1024 threads are too much for the hardware, the method below can be adapted
 		//wsum_reduction_partial << <40, 512 >> > (dev_temp_u_opt, dev_u_opt, 0);
 		//wsum_reduction_partial << <40, 512 >> > (dev_temp_u_opt, dev_u_opt_part, 512);
 		//sumControl << <20, 20 >> > (dev_u_opt_part, dev_u_opt);
 
-		//cudaEventRecord(stop, 0);
+		cudaEventRecord(stop, 0);
 
-		//// Show runtime in miliseconds
-		//cudaEventSynchronize(stop);
-		//cudaEventElapsedTime(&time, start, stop);
-		////printf("kernal runtime: %.5f ms\n", time);
-		//cudaEventDestroy(start);
-		//cudaEventDestroy(stop);
+		// Show runtime in miliseconds
+		cudaEventSynchronize(stop);
+		cudaEventElapsedTime(&time, start, stop);
+		printf("kernal runtime: %.5f ms\n", time);
+		cudaEventDestroy(start);
+		cudaEventDestroy(stop);
 
 		// Acts as a syncing buffer so no need for additional synhronization
 		cudaMemcpy(host_V, dev_V, int(K * N_HRZ) * sizeof(Control), cudaMemcpyDeviceToHost);
@@ -631,62 +644,63 @@ int main() {
 		cudaMemcpy(host_u_opt, dev_u_opt, int(N_HRZ) * sizeof(Control), cudaMemcpyDeviceToHost);
 		cudaMemcpy(host_rollout_costList, dev_rollout_costList, int(K) * sizeof(float), cudaMemcpyDeviceToHost);
 		
+		//// Store rollout data to csv, which can be visualized using Matlab
+		//for (int j = 0; j < 40 * 1024; j++) {
+		//	testFile << host_stateList[j].x << ",";
+		//}
+		//testFile << std::endl;
+		//for (int j = 0; j < 40 * 1024; j++) {
+		//	testFile << host_stateList[j].y << ",";
+		//}
+		//testFile << std::endl;
+		//for (int j = 0; j < 40 * 1024; j++) {
+		//	testFile << host_stateList[j].phi << ",";
+		//}
+		//testFile << std::endl;
+		//for (int j = 0; j < 40 * 1024; j++) {
+		//	testFile << host_stateList[j].v0 << ",";
+		//}
+		//testFile << std::endl;
+
+		//// Store rollout cost (K) to a apecific csv file
+		//for (int j = 0; j < 1024; j++) {
+		//	cost << host_rollout_costList[j] << std::endl;
+		//}
+
+		//// Store the weighted control sequence and its predicted states to a csv file
+		//State predstate[40];
+		//predstate[0] = host_x0;
+		//for (int i = 0; i < N_HRZ; i++) {
+		//	int count = i - 1;
+		//	if (count < 0) count = 0;
+		//	predstate[i] = bicycleModel(predstate[count], host_u_opt[i]);
+		//}
+		//for (int j = 0; j < 40 ; j++) {
+		//	predFile << predstate[j].x << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40 ; j++) {
+		//	predFile << predstate[j].y << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40 ; j++) {
+		//	predFile << predstate[j].phi << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40 ; j++) {
+		//	predFile << predstate[j].v0 << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40; j++) {
+		//	predFile << host_u_opt[j].vd << ",";
+		//}
+		//predFile << std::endl;
+		//for (int j = 0; j < 40; j++) {
+		//	predFile << host_u_opt[j].wd << ",";
+		//}
+		//predFile << std::endl;
 		
-		for (int j = 0; j < 40 * 1024; j++) {
-			testFile << host_stateList[j].x << ",";
-		}
-		testFile << std::endl;
-		for (int j = 0; j < 40 * 1024; j++) {
-			testFile << host_stateList[j].y << ",";
-		}
-		testFile << std::endl;
-		for (int j = 0; j < 40 * 1024; j++) {
-			testFile << host_stateList[j].phi << ",";
-		}
-		testFile << std::endl;
-		for (int j = 0; j < 40 * 1024; j++) {
-			testFile << host_stateList[j].v0 << ",";
-		}
-		testFile << std::endl;
-
-		for (int j = 0; j < 1024; j++) {
-			cost << host_rollout_costList[j] << std::endl;
-		}
-
-		State predstate[40];
-		predstate[0] = host_x0;
-		for (int i = 0; i < N_HRZ; i++) {
-			int count = i - 1;
-			if (count < 0) count = 0;
-			predstate[i] = bicycleModel(predstate[count], host_u_opt[i]);
-		}
-
-		for (int j = 0; j < 40 ; j++) {
-			predFile << predstate[j].x << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40 ; j++) {
-			predFile << predstate[j].y << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40 ; j++) {
-			predFile << predstate[j].phi << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40 ; j++) {
-			predFile << predstate[j].v0 << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40; j++) {
-			predFile << host_u_opt[j].vd << ",";
-		}
-		predFile << std::endl;
-		for (int j = 0; j < 40; j++) {
-			predFile << host_u_opt[j].wd << ",";
-		}
-		predFile << std::endl;
-		
-
+		//// Not really important here
 		//printf("returned random value is %.1f %.1f %.1f\n", host_V[0].vd, host_V[1].vd, host_V[2].wd);
 		//printf("returned state list value is %.1f %.1f %.1f %.1f\n", host_stateList[1].x, host_stateList[1].y, host_stateList[1].phi, host_stateList[1].v0);
 		//printf("returned state list value is %.1f %.1f %.1f %.1f\n", host_stateList[5].x, host_stateList[5].y, host_stateList[5].phi, host_stateList[5].v0);
@@ -704,13 +718,13 @@ int main() {
 
 
 		// Generate the predicted next state with u_opt
-		//printf("orig: %.3f %.3f\n", host_x0.x, host_x0.y);
 		host_x0 = bicycleModel(host_x0, host_u_opt[0]);
+
+		// Store state data to csv and see results by plotting data in excel
 		printf("%.3f, %.3f, %.3f, %.3f, %.3f, %.3f\n", host_x0.x, host_x0.y, host_x0.phi, host_x0.v0, host_u_opt[0].vd, host_u_opt[0].wd);
 		//outputFile << it << "," << host_x0.x << "," << host_x0.y << "," << host_x0.phi << "," << host_x0.v0 << "," << host_u_opt[0].vd << "," << host_u_opt[0].wd << std::endl;
-		//printf("%.3f, %.3f, %.3f, %.3f\n", host_x0.x, host_x0.y, host_x0.phi, host_x0.v0);
-		// Shift the control by 1 
 
+		// Shift the control by 1 
 		output_u0 = host_u_opt[0];
 		memmove(host_u_opt, &host_u_opt[1], int(N_HRZ - 1) * sizeof(Control)); // use memmove instead of memcpy because the destination overlaps the source
 		host_u_opt[int(N_HRZ)] = host_u_opt[int(N_HRZ) - 1];
