@@ -28,7 +28,7 @@ using namespace std;
 
 #define CONTROLSIZE 2				// Number of controls u = [vd,wd]
 #define STATESIZE   4				// Number of states   x = [x,y,phi,v0]
-#define T_HRZ       2.0f			// Prediction time hoeizon
+#define T_HRZ       5.0f			// Prediction time hoeizon
 #define F_STP		20.0f			// Frequency of prediction (control freq)
 #define T_STP		1/F_STP			// Period of prediction
 #define N_HRZ       T_HRZ*F_STP		// N steps in a time horizon
@@ -46,6 +46,19 @@ using namespace std;
 #define TRACK_ERR_COST	5.0f		// Penalty for tracking error (parting from the middle)
 
 #define ITERATIONS 4500
+
+#define CUDA_CALL(x) do { if((x) != cudaSuccess) { \
+    printf("Error at %s:%d\n",__FILE__,__LINE__); \
+    return EXIT_FAILURE;}} while(0);
+
+#define CUDA_SAFE_CALL(call) do { \
+	cudaError_t err = call; \
+	if (cudaSuccess != err) { \
+		fprintf(stderr, "Cuda error in file '%s' in line %i : %s.", \
+			__FILE__, __LINE__, cudaGetErrorString(err)); \
+		exit(EXIT_FAILURE); \
+	} \
+} while (0);
 
 struct Control {
 	float vd, wd;
@@ -341,7 +354,7 @@ __global__ void calcRolloutCost(float* input, float* output) {
 
 __global__ void calcRolloutCost2(float* input, float* output) {
 	/*  Sequential addressing (reduction sum)*/
-	__shared__ float partial_sum[40];
+	__shared__ float partial_sum[SHMEM_SIZE];
 
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -618,37 +631,37 @@ int main() {
 
 	// Setup device memory
 	//cudaMalloc((void**)&/*dev_cstate*/, int(K * N_HRZ) * sizeof(curandState));
-	cudaMalloc((void**)&dev_V, int(K * N_HRZ) * sizeof(Control));
-	cudaMalloc((void**)&dev_x0, sizeof(State));
-	cudaMalloc((void**)&dev_stateList, int(K * N_HRZ) * sizeof(State));
-	cudaMalloc((void**)&dev_state_costList, int(K * N_HRZ) * sizeof(float));
-	cudaMalloc((void**)&dev_rollout_costList, int(K) * sizeof(float));
-	cudaMalloc((void**)&dev_mid_fcn, 4 * sizeof(Track));
-	cudaMalloc((void**)&dev_in_fcn, 4 * sizeof(Track));
-	cudaMalloc((void**)&dev_out_fcn, 4 * sizeof(Track));
-	cudaMalloc((void**)&dev_mid_intersec, 4 * sizeof(Pos));
-	cudaMalloc((void**)&dev_in_intersec, 4 * sizeof(Pos));
-	cudaMalloc((void**)&dev_out_intersec, 4 * sizeof(Pos));
-	cudaMalloc((void**)&dev_rho, int(K) * sizeof(float));
-	cudaMalloc((void**)&dev_w_tilde, int(K) * sizeof(float));
-	cudaMalloc((void**)&dev_eta, int(K) * sizeof(float));
-	cudaMalloc((void**)&dev_u_opt, int(N_HRZ) * sizeof(Control));
-	cudaMalloc((void**)&dev_u_opt_part, int(N_HRZ) * sizeof(Control));
-	cudaMalloc((void**)&dev_u_opt_part2, int(N_HRZ) * sizeof(Control));
-	cudaMalloc((void**)&dev_u_opt_part3, int(N_HRZ) * sizeof(Control));
-	cudaMalloc((void**)&dev_temp_u_opt, int(K * N_HRZ) * sizeof(Control));
-	cudaMalloc((void**)&dev_U, int(N_HRZ) * sizeof(Control));
-	cudaMalloc((void**)&dev_obstacle, NUM_OBS * sizeof(Obs));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_V, int(K * N_HRZ) * sizeof(Control)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_x0, sizeof(State)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_stateList, int(K * N_HRZ) * sizeof(State)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_state_costList, int(K * N_HRZ) * sizeof(float)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_rollout_costList, int(K) * sizeof(float)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_mid_fcn, 4 * sizeof(Track)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_in_fcn, 4 * sizeof(Track)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_out_fcn, 4 * sizeof(Track)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_mid_intersec, 4 * sizeof(Pos)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_in_intersec, 4 * sizeof(Pos)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_out_intersec, 4 * sizeof(Pos)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_rho, int(K) * sizeof(float)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_w_tilde, int(K) * sizeof(float)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_eta, int(K) * sizeof(float)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_u_opt, int(N_HRZ) * sizeof(Control)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_u_opt_part, int(N_HRZ) * sizeof(Control)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_u_opt_part2, int(N_HRZ) * sizeof(Control)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_u_opt_part3, int(N_HRZ) * sizeof(Control)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_temp_u_opt, int(K * N_HRZ) * sizeof(Control)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_U, int(N_HRZ) * sizeof(Control)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_obstacle, NUM_OBS * sizeof(Obs)));
 
 	// Setup constant memory
 	build_track(host_in_fcn, host_out_fcn, host_mid_intersec, host_in_intersec, host_out_intersec, host_mid_fcn);
-	cudaMemcpy(dev_mid_fcn, host_mid_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice);
-	cudaMemcpy(dev_in_fcn, host_in_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice);
-	cudaMemcpy(dev_out_fcn, host_out_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice);
-	cudaMemcpy(dev_mid_intersec, host_mid_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
-	cudaMemcpy(dev_in_intersec, host_in_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
-	cudaMemcpy(dev_out_intersec, host_out_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice);
-	cudaMemcpy(dev_obstacle, host_obstacle, NUM_OBS * sizeof(Obs), cudaMemcpyHostToDevice);
+	CUDA_SAFE_CALL(cudaMemcpy(dev_mid_fcn, host_mid_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL(cudaMemcpy(dev_in_fcn, host_in_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL(cudaMemcpy(dev_out_fcn, host_out_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL(cudaMemcpy(dev_mid_intersec, host_mid_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL(cudaMemcpy(dev_in_intersec, host_in_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL(cudaMemcpy(dev_out_intersec, host_out_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL(cudaMemcpy(dev_obstacle, host_obstacle, NUM_OBS * sizeof(Obs), cudaMemcpyHostToDevice));
 
 	// Initialize nominal conrtrol
 	for (int n = 0; n < N_HRZ; n++) {
@@ -678,13 +691,14 @@ int main() {
 	// Calculate average runtime 
 	double runtime_avg = 0;
 	double runtime_list[ITERATIONS] = { 0 };
+	
+	
 
 	// Start actual MPC iteration
 	for (int it = 0; it < ITERATIONS; it++) {
 		auto start = chrono::steady_clock::now();
-
-		cudaMemcpy(dev_U, host_U, int(N_HRZ) * sizeof(Control), cudaMemcpyHostToDevice);
-		cudaMemcpy(dev_x0, &host_x0, sizeof(State), cudaMemcpyHostToDevice);
+		CUDA_SAFE_CALL(cudaMemcpy(dev_U, host_U, int(N_HRZ) * sizeof(Control), cudaMemcpyHostToDevice));
+		CUDA_SAFE_CALL(cudaMemcpy(dev_x0, &host_x0, sizeof(State), cudaMemcpyHostToDevice));
 
 		// Launch kernal functions
 		//cudaEventRecord(start, 0);
@@ -694,13 +708,13 @@ int main() {
 
 		//genControl << <K, N_HRZ >> > (dev_cstate, dev_V, dev_U, RAND_SCALAR);
 		//cout << 1000*time(NULL) << endl;
-		genControlNew << <K, N_HRZ >> > (time(NULL), dev_V, dev_U, RAND_SCALAR);
+		genControlNew << <K, int(N_HRZ) >> > (time(NULL), dev_V, dev_U, RAND_SCALAR);
 
 		genState << <K / 256, K / 4 >> > (dev_stateList, dev_x0, dev_V);
 
-		costFcn << <N_HRZ * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn, dev_obstacle);
+		costFcn << <int(N_HRZ) * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn, dev_obstacle);
 
-		calcRolloutCost2 << <K, N_HRZ >> > (dev_state_costList, dev_rollout_costList);
+		calcRolloutCost2 << <K, int(N_HRZ) >> > (dev_state_costList, dev_rollout_costList);
 
 		min_reduction << <K / 32 / 2, K / 32 >> > (dev_rollout_costList, dev_rho);
 		min_reduction2 << <1, K / 32 >> > (dev_rho, dev_rho);
@@ -716,7 +730,7 @@ int main() {
 		//genW << <K, int(N_HRZ) >> > (dev_temp_u_opt, dev_eta, dev_w_tilde, dev_V);
 		genWCorrect << <K, int(N_HRZ) >> > (dev_temp_u_opt, dev_eta, dev_w_tilde, dev_V, dev_U);
 
-		wsum_reduction << <N_HRZ, K >> > (dev_temp_u_opt, dev_u_opt);
+		wsum_reduction << <int(N_HRZ), K >> > (dev_temp_u_opt, dev_u_opt);
 
 		// If 1024 threads are too much for the hardware, the method below can be adapted
 		// <<< N_HRZ, K(max threads(512, 1024, 2048)) >>>
@@ -738,10 +752,10 @@ int main() {
 		//cudaEventDestroy(stop);
 
 		// Acts as a syncing buffer so no need for additional synhronization
-		cudaMemcpy(host_V, dev_V, int(K * N_HRZ) * sizeof(Control), cudaMemcpyDeviceToHost);
-		cudaMemcpy(host_stateList, dev_stateList, int(K * N_HRZ) * sizeof(State), cudaMemcpyDeviceToHost);
-		cudaMemcpy(host_u_opt, dev_u_opt, int(N_HRZ) * sizeof(Control), cudaMemcpyDeviceToHost);
-		cudaMemcpy(host_rollout_costList, dev_rollout_costList, int(K) * sizeof(float), cudaMemcpyDeviceToHost);
+		CUDA_SAFE_CALL(cudaMemcpy(host_V, dev_V, int(K * N_HRZ) * sizeof(Control), cudaMemcpyDeviceToHost));
+		CUDA_SAFE_CALL(cudaMemcpy(host_stateList, dev_stateList, int(K * N_HRZ) * sizeof(State), cudaMemcpyDeviceToHost));
+		CUDA_SAFE_CALL(cudaMemcpy(host_u_opt, dev_u_opt, int(N_HRZ) * sizeof(Control), cudaMemcpyDeviceToHost));
+		CUDA_SAFE_CALL(cudaMemcpy(host_rollout_costList, dev_rollout_costList, int(K) * sizeof(float), cudaMemcpyDeviceToHost));
 
 		// //Store rollout data to csv, which can be visualized using Matlab
 		//for (int j = 0; j < 40 * 1024; j++) {
