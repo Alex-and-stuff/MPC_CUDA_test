@@ -34,16 +34,22 @@ using namespace std;
 #define N_HRZ       T_HRZ*F_STP		// N steps in a time horizon
 #define K			1024            // K-rollout predictions
 #define V_MAX       2.5f			// Velocity command upper-bound
-#define V_MIN       1.6f			// Velocity command lower-bound
-#define W_MAX		1.5f			// Angular acceleration command upper-bound
-#define W_MIN		-1.5f			// Angular acceleration command lower-bound
+#define V_MIN       1.8f			// Velocity command lower-bound
+#define W_MAX		1.0f			// Angular acceleration command upper-bound
+#define W_MIN		-1.0f			// Angular acceleration command lower-bound
 #define ROAD_WIDTH  2.0f			// Width of road (unit: m)
 #define LAMBDA      100.0f
-#define RAND_SCALAR 3.0f
+#define RAND_SCALAR 1.0f
+#define RHO         0.3f
+
+#define FG_RAD      10.0f
+#define GH_RAD		10.0f
+#define HI_RAD      10.0f
+#define IF_RAD      10.0f
 
 #define OFF_ROAD_COST	500.0f		// Penalty for leaving the road
 #define COLLISION_COST	800.0f		// Penalty for colliding into an obstacle
-#define TRACK_ERR_COST	5.0f		// Penalty for tracking error (parting from the middle)
+#define TRACK_ERR_COST	10.0f		// Penalty for tracking error (parting from the middle)
 
 #define ITERATIONS 4500
 
@@ -107,6 +113,7 @@ __global__ void sum_reduction(float* v, float* v_r) {
 	}
 }
 
+
 __host__ __device__ State bicycleModel(State state, Control u) {
 	/*  Linear bicycle model, which geneates state_dot. Then by integrating the state_dot,
 		we can then get the nest state x_k+1*/
@@ -135,7 +142,7 @@ __device__ void clampingFcn(Control* u_in) {
 	else if (u_in->wd < W_MIN) { u_in->wd = W_MIN; }
 }
 
-__device__ float distanceFromTrack(float inner_f, float inner_g, float inner_h,
+__device__ float distanceFromTrack_old(float inner_f, float inner_g, float inner_h,
 	float inner_i, Track* inner_fcn) {
 	/*  Calculates the distance from the middle of a designated path
 		(Here, from the Tetragon imposing the road infront of the schools library)*/
@@ -180,28 +187,221 @@ __device__ float distanceFromTrack(float inner_f, float inner_g, float inner_h,
 	return distance;
 }
 
-__device__ float calculateCost(State* state, Track* outer_fcn, Track* inner_fcn) {
-	/* Calculate the cost of a current state (obstacle collision part added)*/
+__device__ float pointToLineDist(float inner, Track line) {
+	float a = line.a;
+	float b = line.b;
+	return fabs(inner) / sqrtf(a * a + b * b);
+}
+
+__device__ float distanceFromTrack(float* inner, float* nominal, Track* inner_fcn, Pos* turn_circle_intersec, State* state) {
+	/*  Calculates the distance from the middle of a designated path
+		(Here, from the Tetragon imposing the road infront of the schools library)*/
+
+	float slope[] = {-inner_fcn[0].a, -inner_fcn[1].a, -inner_fcn[2].a, -inner_fcn[3].a};
+
+	// Distance from the curves 
+	// @TODO
+	if (nominal[0] >= 0 && nominal[1] <= 0) {  // curve fg
+		return fabs(sqrtf((state->x - turn_circle_intersec[0].x) * (state->x - turn_circle_intersec[0].x)
+			+ (state->y - turn_circle_intersec[0].y) * (state->y - turn_circle_intersec[0].y)) - FG_RAD);
+	}
+	if (nominal[2] >= 0 && nominal[3] >= 0) {  // curve gh
+		return fabs(sqrtf((state->x - turn_circle_intersec[1].x) * (state->x - turn_circle_intersec[1].x)
+			+ (state->y - turn_circle_intersec[1].y) * (state->y - turn_circle_intersec[1].y)) - GH_RAD);
+	}
+	if (nominal[4] <= 0 && nominal[5] >= 0) {  // curve hi
+		return fabs(sqrtf((state->x - turn_circle_intersec[2].x) * (state->x - turn_circle_intersec[2].x)
+			+ (state->y - turn_circle_intersec[2].y) * (state->y - turn_circle_intersec[2].y)) - HI_RAD);
+	}
+	if (nominal[6] <= 0 && nominal[7] <= 0) {  // curve if
+		return fabs(sqrtf((state->x - turn_circle_intersec[3].x) * (state->x - turn_circle_intersec[3].x)
+			+ (state->y - turn_circle_intersec[3].y) * (state->y - turn_circle_intersec[3].y)) - IF_RAD);
+	}
+
+	// Distance from the tracks (outside of the inner functions)
+	if(inner[0] < 0 && nominal[0] <= 0 && nominal[7] >= 0){
+	//if (inner[0] < 0 && inner[1] < 0 && inner[2] < 0 && inner[3] > 0) {
+		//return fabs(fabs(inner[0] * cosf(atanf(slope[0]))) - 0.5 * ROAD_WIDTH);  // respect to line: f
+		return fabs(pointToLineDist(inner[0], inner_fcn[0]) - 0.5 * ROAD_WIDTH);
+	}
+	if (inner[1] > 0 && nominal[1] >= 0 && nominal[2] <= 0) {
+	//if (inner[0] > 0 && inner[1] > 0 && inner[2] < 0 && inner[3] > 0) {
+		//return fabs(fabs(inner[1] * cosf(atanf(slope[1]))) - 0.5 * ROAD_WIDTH);  // respect to line: g
+		return fabs(pointToLineDist(inner[1], inner_fcn[1]) - 0.5 * ROAD_WIDTH);
+	}
+	if (inner[2] > 0 && nominal[3] <= 0 && nominal[4] >= 0) {
+	//if (inner[0] > 0 && inner[1] < 0 && inner[2] > 0 && inner[3] > 0) {
+		//return fabs(fabs(inner[2] * cosf(atanf(slope[2]))) - 0.5 * ROAD_WIDTH);  // respect to line: h
+		return fabs(pointToLineDist(inner[2], inner_fcn[2]) - 0.5 * ROAD_WIDTH);
+	}
+	if (inner[3] < 0 && nominal[5] <= 0 && nominal[6] >= 0) {
+	//if (inner[0] > 0 && inner[1] < 0 && inner[2] < 0 && inner[3] < 0) {
+		//return fabs(fabs(inner[3] * cosf(atanf(slope[3]))) - 0.5 * ROAD_WIDTH);  // respect to line: i
+		return fabs(pointToLineDist(inner[3], inner_fcn[3]) - 0.5 * ROAD_WIDTH);
+	}
+
+	 //Distance from the tracks (inside of the inner functions)
+	if (inner[0] > 0 && inner[1] < 0 && inner[2] < 0 && inner[3] > 0) {
+		float dist_f = fabs(pointToLineDist(inner[0], inner_fcn[0]) + 0.5 * ROAD_WIDTH);
+		float dist_g = fabs(pointToLineDist(inner[1], inner_fcn[1]) + 0.5 * ROAD_WIDTH);
+		float dist_h = fabs(pointToLineDist(inner[2], inner_fcn[2]) + 0.5 * ROAD_WIDTH);
+		float dist_i = fabs(pointToLineDist(inner[3], inner_fcn[3]) + 0.5 * ROAD_WIDTH);
+		float min1, min2;
+		(dist_f > dist_g) ? min1 = dist_g : min1 = dist_f;
+		(dist_h > dist_i) ? min2 = dist_i : min2 = dist_h;
+		if (min1 > min2){ 
+			return min2; 
+		}
+		else{ 
+			return min1; 
+		}
+	}
+
+	// If point lies on inner function(s)
+	if (inner[0] == 0 || inner[1] == 0 || inner[2] == 0 || inner[3] == 0) {
+		float inner_min = 0.0f;
+		(fabs(inner[0]) > fabs(inner[1])) ? inner_min = fabs(inner[1]) : inner_min = fabs(inner[0]);
+		(inner_min > fabs(inner[2])) ? inner_min = fabs(inner[2]) : inner_min = inner_min;
+		(inner_min > fabs(inner[3])) ? inner_min = fabs(inner[3]) : inner_min = inner_min;
+		return fabs(inner_min + 0.5 * ROAD_WIDTH);
+	}
+	return 0;
+}
+
+__device__ float distanceFromTrackStraight(float* inner, Track* inner_fcn, Pos* in_intersec, State* state) {
+	/*  Calculates the distance from the middle of a designated path
+		(Here, from the Tetragon imposing the road infront of the schools library)*/
+
+	float slope[] = { -inner_fcn[0].a, -inner_fcn[1].a, -inner_fcn[2].a, -inner_fcn[3].a };
+
+	// Distance from the curves 
+	// @TODO
+	if (inner[0] <= 0 && inner[1] >= 0) {  // curve fg
+		return fabs(sqrtf((state->x - in_intersec[0].x) * (state->x - in_intersec[0].x)
+			+ (state->y - in_intersec[0].y) * (state->y - in_intersec[0].y)) - 0.5 * ROAD_WIDTH);
+	}
+	if (inner[1] >= 0 && inner[2] >= 0) {  // curve gh
+		return fabs(sqrtf((state->x - in_intersec[1].x) * (state->x - in_intersec[1].x)
+			+ (state->y - in_intersec[1].y) * (state->y - in_intersec[1].y)) - 0.5 * ROAD_WIDTH);
+	}
+	if (inner[2] >= 0 && inner[3] <= 0) {  // curve hi
+		return fabs(sqrtf((state->x - in_intersec[2].x) * (state->x - in_intersec[2].x)
+			+ (state->y - in_intersec[2].y) * (state->y - in_intersec[2].y)) - 0.5 * ROAD_WIDTH);
+	}
+	if (inner[3] <= 0 && inner[0] <= 0) {  // curve if
+		return fabs(sqrtf((state->x - in_intersec[3].x) * (state->x - in_intersec[3].x)
+			+ (state->y - in_intersec[3].y) * (state->y - in_intersec[3].y)) - 0.5 * ROAD_WIDTH);
+	}
+
+	// Distance from the tracks (outside of the inner functions)
+	if (inner[0] <= 0 && inner[1] <= 0 && inner[3] >= 0) {
+		//if (inner[0] < 0 && inner[1] < 0 && inner[2] < 0 && inner[3] > 0) {
+			//return fabs(fabs(inner[0] * cosf(atanf(slope[0]))) - 0.5 * ROAD_WIDTH);  // respect to line: f
+		return fabs(pointToLineDist(inner[0], inner_fcn[0]) - 0.5 * ROAD_WIDTH);
+	}
+	if (inner[0] >= 0 && inner[1] >= 0 && inner[2] <= 0) {
+		//if (inner[0] > 0 && inner[1] > 0 && inner[2] < 0 && inner[3] > 0) {
+			//return fabs(fabs(inner[1] * cosf(atanf(slope[1]))) - 0.5 * ROAD_WIDTH);  // respect to line: g
+		return fabs(pointToLineDist(inner[1], inner_fcn[1]) - 0.5 * ROAD_WIDTH);
+	}
+	if (inner[1] <= 0 && inner[2] >= 0 && inner[3] >= 0) {
+		//if (inner[0] > 0 && inner[1] < 0 && inner[2] > 0 && inner[3] > 0) {
+			//return fabs(fabs(inner[2] * cosf(atanf(slope[2]))) - 0.5 * ROAD_WIDTH);  // respect to line: h
+		return fabs(pointToLineDist(inner[2], inner_fcn[2]) - 0.5 * ROAD_WIDTH);
+	}
+	if (inner[0] >= 0 && inner[2] <= 0 && inner[3] <= 0) {
+		//if (inner[0] > 0 && inner[1] < 0 && inner[2] < 0 && inner[3] < 0) {
+			//return fabs(fabs(inner[3] * cosf(atanf(slope[3]))) - 0.5 * ROAD_WIDTH);  // respect to line: i
+		return fabs(pointToLineDist(inner[3], inner_fcn[3]) - 0.5 * ROAD_WIDTH);
+	}
+
+	//Distance from the tracks (inside of the inner functions)
+	if (inner[0] > 0 && inner[1] < 0 && inner[2] < 0 && inner[3] > 0) {
+		float dist_f = fabs(pointToLineDist(inner[0], inner_fcn[0]) + 0.5 * ROAD_WIDTH);
+		float dist_g = fabs(pointToLineDist(inner[1], inner_fcn[1]) + 0.5 * ROAD_WIDTH);
+		float dist_h = fabs(pointToLineDist(inner[2], inner_fcn[2]) + 0.5 * ROAD_WIDTH);
+		float dist_i = fabs(pointToLineDist(inner[3], inner_fcn[3]) + 0.5 * ROAD_WIDTH);
+		float min1, min2;
+		(dist_f > dist_g) ? min1 = dist_g : min1 = dist_f;
+		(dist_h > dist_i) ? min2 = dist_i : min2 = dist_h;
+		if (min1 > min2) {
+			return min2;
+		}
+		else {
+			return min1;
+		}
+	}
+
+	// If point lies on inner function(s)
+	if (inner[0] == 0 || inner[1] == 0 || inner[2] == 0 || inner[3] == 0) {
+		float inner_min = 0.0f;
+		(fabs(inner[0]) > fabs(inner[1])) ? inner_min = fabs(inner[1]) : inner_min = fabs(inner[0]);
+		(inner_min > fabs(inner[2])) ? inner_min = fabs(inner[2]) : inner_min = inner_min;
+		(inner_min > fabs(inner[3])) ? inner_min = fabs(inner[3]) : inner_min = inner_min;
+		return fabs(inner_min + 0.5 * ROAD_WIDTH);
+	}
+	return 0;
+}
+
+__device__ float calculateCost(State* state, Track* outer_fcn, Track* inner_fcn, Track* nominal_fcn, Pos* turn_circle_intersec) {
+	/* Calculate the cost of a current state (obstacle collision part added)
+	 * index of the path names
+	 *          g
+	 *        ______
+	 *       /     /
+	 *    h /     / f
+	 *     /     /
+	 *     ------
+	 *       i
+	 * f, g intersection : [x1, y1]
+	 * g, h intersection : [x2, y2]
+	 * h, i intersection : [x3, y3]
+	 * i, f intersection : [x4, y4]*/
 
 	float state_cost = 0.0f;
-	float outer_f = outer_fcn[0].b * state->y + outer_fcn[0].a * state->x + outer_fcn[0].c;
-	float outer_g = outer_fcn[1].b * state->y + outer_fcn[1].a * state->x + outer_fcn[1].c;
-	float outer_h = outer_fcn[2].b * state->y + outer_fcn[2].a * state->x + outer_fcn[2].c;
-	float outer_i = outer_fcn[3].b * state->y + outer_fcn[3].a * state->x + outer_fcn[3].c;
 
-	float inner_f = inner_fcn[0].b * state->y + inner_fcn[0].a * state->x + inner_fcn[0].c;
-	float inner_g = inner_fcn[1].b * state->y + inner_fcn[1].a * state->x + inner_fcn[1].c;
-	float inner_h = inner_fcn[2].b * state->y + inner_fcn[2].a * state->x + inner_fcn[2].c;
-	float inner_i = inner_fcn[3].b * state->y + inner_fcn[3].a * state->x + inner_fcn[3].c;
+	float outer[4] = {
+		outer_fcn[0].b * state->y + outer_fcn[0].a * state->x + outer_fcn[0].c,
+		outer_fcn[1].b * state->y + outer_fcn[1].a * state->x + outer_fcn[1].c,
+		outer_fcn[2].b * state->y + outer_fcn[2].a * state->x + outer_fcn[2].c,
+		outer_fcn[3].b * state->y + outer_fcn[3].a * state->x + outer_fcn[3].c
+	};
 
-	float distance = distanceFromTrack(inner_f, inner_g, inner_h, inner_i, inner_fcn);
-	if ((outer_f > 0 && outer_g < 0 && outer_h < 0 && outer_i>0) &&
-		!(inner_f > 0 && inner_g < 0 && inner_h < 0 && inner_i>0)) {
-		state_cost += 0;
+	float inner[4] = {
+		inner_fcn[0].b* state->y + inner_fcn[0].a * state->x + inner_fcn[0].c,
+		inner_fcn[1].b* state->y + inner_fcn[1].a * state->x + inner_fcn[1].c,
+		inner_fcn[2].b* state->y + inner_fcn[2].a * state->x + inner_fcn[2].c,
+		inner_fcn[3].b* state->y + inner_fcn[3].a * state->x + inner_fcn[3].c
+	};
+
+	float nominal[8] = {
+		nominal_fcn[0].b* state->y + nominal_fcn[0].a * state->x + nominal_fcn[0].c,
+		nominal_fcn[1].b* state->y + nominal_fcn[1].a * state->x + nominal_fcn[1].c,
+		nominal_fcn[2].b* state->y + nominal_fcn[2].a * state->x + nominal_fcn[2].c,
+		nominal_fcn[3].b* state->y + nominal_fcn[3].a * state->x + nominal_fcn[3].c,
+		nominal_fcn[4].b* state->y + nominal_fcn[4].a * state->x + nominal_fcn[4].c,
+		nominal_fcn[5].b* state->y + nominal_fcn[5].a * state->x + nominal_fcn[5].c,
+		nominal_fcn[6].b* state->y + nominal_fcn[6].a * state->x + nominal_fcn[6].c,
+		nominal_fcn[7].b* state->y + nominal_fcn[7].a * state->x + nominal_fcn[7].c
+	};
+
+	//float distance = distanceFromTrack(inner_f, inner_g, inner_h, inner_i, inner_fcn);
+	float distance = distanceFromTrack(inner, nominal, inner_fcn, turn_circle_intersec, state); // @TODO
+	if ((nominal[0] > 0 && nominal[1] < 0) || (nominal[2] > 0 && nominal[3] > 0) || (nominal[4] < 0 && nominal[5] > 0) || (nominal[6] < 0 && nominal[7] < 0)) {
+		if (distance > ROAD_WIDTH / 2) {
+			state_cost += OFF_ROAD_COST;
+		}
 	}
 	else {
-		state_cost += OFF_ROAD_COST;
+		if ((outer[0] > 0 && outer[1] < 0 && outer[2] < 0 && outer[3]>0) &&
+			!(inner[0] > 0 && inner[1] < 0 && inner[2] < 0 && inner[3]>0)) {
+			state_cost += 0;
+		}
+		else {
+			state_cost += OFF_ROAD_COST;
+		}
 	}
+	
 	state_cost += distance / (ROAD_WIDTH / 2) * TRACK_ERR_COST;
 	return state_cost;
 }
@@ -289,7 +489,7 @@ __global__ void genState(State* state_list, State* init_state, Control* pert_con
 
 
 
-__global__ void costFcn(float* cost_list, State* state_list,
+__global__ void costFcn_old(float* cost_list, State* state_list,
 	Track* outer_fcn, Track* inner_fcn, Obs* obstacle) {
 	/*  Calculate all the state costs in the prediction horizon
 		for each rollout k */
@@ -308,7 +508,7 @@ __global__ void costFcn(float* cost_list, State* state_list,
 	float inner_g = inner_fcn[1].b * state.y + inner_fcn[1].a * state.x + inner_fcn[1].c;
 	float inner_h = inner_fcn[2].b * state.y + inner_fcn[2].a * state.x + inner_fcn[2].c;
 	float inner_i = inner_fcn[3].b * state.y + inner_fcn[3].a * state.x + inner_fcn[3].c;
-	float distance = distanceFromTrack(inner_f, inner_g, inner_h, inner_i, inner_fcn);
+	float distance = distanceFromTrack_old(inner_f, inner_g, inner_h, inner_i, inner_fcn);
 
 	if ((outer_f > 0 && outer_g < 0 && outer_h < 0 && outer_i>0) &&
 		!(inner_f > 0 && inner_g < 0 && inner_h < 0 && inner_i > 0)) {
@@ -317,6 +517,139 @@ __global__ void costFcn(float* cost_list, State* state_list,
 	else {
 		state_cost += OFF_ROAD_COST;
 	}
+	state_cost += distance / (ROAD_WIDTH / 2) * TRACK_ERR_COST;
+
+	// Obstacle avoidance penalty
+
+	float collision = 0.0;
+	for (int i = 0; obstacle[i].x != NULL; i++) {
+		collision = fabs(obstacleCollision(&state, &obstacle[i]));
+		state_cost += collision * COLLISION_COST;
+	}
+	cost_list[idx] = state_cost;
+}
+
+__global__ void costFcn(float* cost_list, State* state_list,
+	Track* outer_fcn, Track* inner_fcn, Track* nominal_fcn, Obs* obstacle, Pos* turn_circle_intersec) {
+	/*  Calculate all the state costs in the prediction horizon
+		for each rollout k */
+	/* Calculate the cost of a current state (obstacle collision part added)
+	* index of the path names
+	*          g
+	*        ______
+	*       /     /
+	*    h /     / f
+	*     /     /
+	*     ------
+	*       i
+	* f, g intersection : [x1, y1]
+	* g, h intersection : [x2, y2]
+	* h, i intersection : [x3, y3]
+	* i, f intersection : [x4, y4]*/
+
+	int idx = threadIdx.x + blockIdx.x * blockDim.x;
+	float state_cost = 0.0f;
+	State state = state_list[idx];
+	
+	float outer[4] = {
+		outer_fcn[0].b * state.y + outer_fcn[0].a * state.x + outer_fcn[0].c,
+		outer_fcn[1].b * state.y + outer_fcn[1].a * state.x + outer_fcn[1].c,
+		outer_fcn[2].b * state.y + outer_fcn[2].a * state.x + outer_fcn[2].c,
+		outer_fcn[3].b * state.y + outer_fcn[3].a * state.x + outer_fcn[3].c
+	};
+
+	float inner[4] = {
+		inner_fcn[0].b * state.y + inner_fcn[0].a * state.x + inner_fcn[0].c,
+		inner_fcn[1].b * state.y + inner_fcn[1].a * state.x + inner_fcn[1].c,
+		inner_fcn[2].b * state.y + inner_fcn[2].a * state.x + inner_fcn[2].c,
+		inner_fcn[3].b * state.y + inner_fcn[3].a * state.x + inner_fcn[3].c
+	};
+
+	float nominal[8] = {
+		nominal_fcn[0].b * state.y + nominal_fcn[0].a * state.x + nominal_fcn[0].c,
+		nominal_fcn[1].b * state.y + nominal_fcn[1].a * state.x + nominal_fcn[1].c,
+		nominal_fcn[2].b * state.y + nominal_fcn[2].a * state.x + nominal_fcn[2].c,
+		nominal_fcn[3].b * state.y + nominal_fcn[3].a * state.x + nominal_fcn[3].c,
+		nominal_fcn[4].b * state.y + nominal_fcn[4].a * state.x + nominal_fcn[4].c,
+		nominal_fcn[5].b * state.y + nominal_fcn[5].a * state.x + nominal_fcn[5].c,
+		nominal_fcn[6].b * state.y + nominal_fcn[6].a * state.x + nominal_fcn[6].c,
+		nominal_fcn[7].b * state.y + nominal_fcn[7].a * state.x + nominal_fcn[7].c
+	};
+	float distance = distanceFromTrack(inner, nominal, inner_fcn, turn_circle_intersec, &state);
+
+	if ((nominal[0] >= 0 && nominal[1] <= 0) || (nominal[2] >= 0 && nominal[3] >= 0) || (nominal[4] <= 0 && nominal[5] >= 0) || (nominal[6] <= 0 && nominal[7] <= 0)) {
+		if (distance > ROAD_WIDTH / 2) {
+			state_cost += OFF_ROAD_COST;
+		}
+	}
+	else {
+		if ((outer[0] > 0 && outer[1] < 0 && outer[2] < 0 && outer[3] > 0) &&
+			!(inner[0] > 0 && inner[1] < 0 && inner[2] < 0 && inner[3] > 0)) {
+			state_cost += 0;
+		}
+		else {
+			state_cost += OFF_ROAD_COST;
+		}
+	}
+	state_cost += distance / (ROAD_WIDTH / 2) * TRACK_ERR_COST;
+	
+	// Obstacle avoidance penalty
+
+	float collision = 0.0;
+	for (int i = 0; obstacle[i].x != NULL; i++) {
+		collision = fabs(obstacleCollision(&state, &obstacle[i]));
+		state_cost += collision * COLLISION_COST;
+    }
+	cost_list[idx] = state_cost;
+}
+
+__global__ void costFcnStraight(float* cost_list, State* state_list,
+	Track* outer_fcn, Track* inner_fcn, Obs* obstacle, Pos* in_intersec) {
+	/*  Calculate all the state costs in the prediction horizon
+		for each rollout k */
+		/* Calculate the cost of a current state (obstacle collision part added)
+		* index of the path names
+		*          g
+		*        ______
+		*       /     /
+		*    h /     / f
+		*     /     /
+		*     ------
+		*       i
+		* f, g intersection : [x1, y1]
+		* g, h intersection : [x2, y2]
+		* h, i intersection : [x3, y3]
+		* i, f intersection : [x4, y4]*/
+
+	int idx = threadIdx.x + blockIdx.x * blockDim.x;
+	float state_cost = 0.0f;
+	State state = state_list[idx];
+
+	float outer[4] = {
+		outer_fcn[0].b * state.y + outer_fcn[0].a * state.x + outer_fcn[0].c,
+		outer_fcn[1].b * state.y + outer_fcn[1].a * state.x + outer_fcn[1].c,
+		outer_fcn[2].b * state.y + outer_fcn[2].a * state.x + outer_fcn[2].c,
+		outer_fcn[3].b * state.y + outer_fcn[3].a * state.x + outer_fcn[3].c
+	};
+
+	float inner[4] = {
+		inner_fcn[0].b * state.y + inner_fcn[0].a * state.x + inner_fcn[0].c,
+		inner_fcn[1].b * state.y + inner_fcn[1].a * state.x + inner_fcn[1].c,
+		inner_fcn[2].b * state.y + inner_fcn[2].a * state.x + inner_fcn[2].c,
+		inner_fcn[3].b * state.y + inner_fcn[3].a * state.x + inner_fcn[3].c
+	};
+
+	float distance = distanceFromTrackStraight(inner, inner_fcn, in_intersec, &state);
+
+	
+	if ((outer[0] > 0 && outer[1] < 0 && outer[2] < 0 && outer[3] > 0) &&
+		!(inner[0] > 0 && inner[1] < 0 && inner[2] < 0 && inner[3] > 0)) {
+		state_cost += 0;
+	}
+	else {
+		state_cost += OFF_ROAD_COST;
+	}
+	
 	state_cost += distance / (ROAD_WIDTH / 2) * TRACK_ERR_COST;
 
 	// Obstacle avoidance penalty
@@ -422,7 +755,7 @@ __global__ void min_reduction2(float* input, float* output) {
 
 __global__ void calcWTilde(float* w_tilde, float* rho, float* cost_list) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
-	w_tilde[idx] = __expf(-1 / LAMBDA * (cost_list[idx] - rho[0]));
+	w_tilde[idx] = expf(-1 / LAMBDA * (cost_list[idx] - rho[0]));
 }
 
 __global__ void genW(Control* u_opt, float* eta, float* w_tilde, Control* V) {
@@ -522,6 +855,11 @@ __global__ void printfloat(float* f) {
 	printf("float: %.3f\n", f[i]);
 }
 
+__global__ void PertCost(float* costList, Control* rand, Control* u) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	costList[i] += RHO * (u[threadIdx.x].vd * RAND_SCALAR * rand[i].vd + u[threadIdx.x].wd * RAND_SCALAR * rand[i].wd);
+}
+
 __host__ Pos getIntersec(Track line1, Track line2) {
 	/*  Calculate the intersection point of two line fcns*/
 	Pos intersec;
@@ -530,10 +868,23 @@ __host__ Pos getIntersec(Track line1, Track line2) {
 	return intersec;
 }
 
-__host__ void build_track(Track* inner_fcn, Track* outer_fcn, Pos* mid_intersec, Pos* inner_intersec,
+__host__ void build_track_old(Track* inner_fcn, Track* outer_fcn, Pos* mid_intersec, Pos* inner_intersec,
 	Pos* outer_intersec, Track* mid_fcn) {
 	/*  Build the boundaries of a designated path, also return
-		the intersection points of the middle path and boundaries*/
+		the intersection points of the middle path and boundaries
+	 *  Index of the path names
+	 *          g
+	 *        ______
+	 *       /     /
+	 *    h /     / f
+	 *     /     /
+	 *     ------
+	 *        i
+	 *  f, g intersection : [x1, y1] :0
+	 *  g, h intersection : [x2, y2] :1
+	 *  h, i intersection : [x3, y3] :2
+	 *  i, f intersection : [x4, y4] :3 */
+
 	float mid_m[4] = { -mid_fcn[0].a, -mid_fcn[1].a, -mid_fcn[2].a, -mid_fcn[3].a };
 
 	memcpy(outer_fcn, mid_fcn, 4 * sizeof(Track));
@@ -564,9 +915,96 @@ __host__ void build_track(Track* inner_fcn, Track* outer_fcn, Pos* mid_intersec,
 	outer_intersec[3] = getIntersec(outer_fcn[3], outer_fcn[0]);
 }
 
+__host__ Track getNominal(Track line, Pos point) {
+	Track nominal;
+	nominal.a = -1 / line.a;
+	nominal.b = line.b;
+	nominal.c = -(nominal.a * point.x + nominal.b * point.y);
+	return nominal;
+}
 
+__host__ void build_track(Track* inner_fcn, Track* outer_fcn, Pos* mid_intersec, Pos* inner_intersec,
+	Pos* outer_intersec, Track* mid_fcn, Pos* turn_center_intersec, Track* nominal_fcn) {
+	/*  Build the boundaries of a designated path, also return
+	the intersection points of the middle path and boundaries
+ *  Index of the path names
+ *          g
+ *        ______
+ *       /     /
+ *    h /     / f
+ *     /     /
+ *     ------
+ *        i
+ *  f, g intersection : [x1, y1] f: 0
+ *  g, h intersection : [x2, y2] g: 1
+ *  h, i intersection : [x3, y3] h: 2
+ *  i, f intersection : [x4, y4] i: 3 */
 
-int main() {
+	float mid_m[4] = { -mid_fcn[0].a, -mid_fcn[1].a, -mid_fcn[2].a, -mid_fcn[3].a };
+
+	memcpy(outer_fcn, mid_fcn, 4 * sizeof(Track));
+	outer_fcn[0].c += (ROAD_WIDTH / 2) / cos(atan(mid_m[0]));
+	outer_fcn[1].c -= (ROAD_WIDTH / 2) / cos(atan(mid_m[1]));
+	outer_fcn[2].c -= (ROAD_WIDTH / 2) / cos(atan(mid_m[2]));
+	outer_fcn[3].c += (ROAD_WIDTH / 2) / cos(atan(mid_m[3]));
+
+	memcpy(inner_fcn, mid_fcn, 4 * sizeof(Track));
+	inner_fcn[0].c -= (ROAD_WIDTH / 2) / cos(atan(mid_m[0]));
+	inner_fcn[1].c += (ROAD_WIDTH / 2) / cos(atan(mid_m[1]));
+	inner_fcn[2].c += (ROAD_WIDTH / 2) / cos(atan(mid_m[2]));
+	inner_fcn[3].c -= (ROAD_WIDTH / 2) / cos(atan(mid_m[3]));
+
+	mid_intersec[0] = getIntersec(mid_fcn[0], mid_fcn[1]);
+	mid_intersec[1] = getIntersec(mid_fcn[1], mid_fcn[2]);
+	mid_intersec[2] = getIntersec(mid_fcn[2], mid_fcn[3]);
+	mid_intersec[3] = getIntersec(mid_fcn[3], mid_fcn[0]);
+
+	inner_intersec[0] = getIntersec(inner_fcn[0], inner_fcn[1]);
+	inner_intersec[1] = getIntersec(inner_fcn[1], inner_fcn[2]);
+	inner_intersec[2] = getIntersec(inner_fcn[2], inner_fcn[3]);
+	inner_intersec[3] = getIntersec(inner_fcn[3], inner_fcn[0]);
+
+	outer_intersec[0] = getIntersec(outer_fcn[0], outer_fcn[1]);
+	outer_intersec[1] = getIntersec(outer_fcn[1], outer_fcn[2]);
+	outer_intersec[2] = getIntersec(outer_fcn[2], outer_fcn[3]);
+	outer_intersec[3] = getIntersec(outer_fcn[3], outer_fcn[0]);
+
+	// Setup the curves
+	Track fg_inner_tmp[2] = { mid_fcn[0], mid_fcn[1] },
+		gh_inner_tmp[2] = { mid_fcn[1], mid_fcn[2] },
+		hi_inner_tmp[2] = { mid_fcn[2], mid_fcn[3] },
+		if_inner_tmp[2] = { mid_fcn[3], mid_fcn[0] };
+
+	// Shift the mid fcn inwards by the turning radius
+	fg_inner_tmp[0].c -= (FG_RAD) / cos(atan(mid_m[0]));
+	fg_inner_tmp[1].c += (FG_RAD) / cos(atan(mid_m[1]));
+
+	gh_inner_tmp[0].c += (GH_RAD) / cos(atan(mid_m[1]));
+	gh_inner_tmp[1].c += (GH_RAD) / cos(atan(mid_m[2]));
+
+	hi_inner_tmp[0].c += (HI_RAD) / cos(atan(mid_m[2]));
+	hi_inner_tmp[1].c -= (HI_RAD) / cos(atan(mid_m[3]));
+
+	if_inner_tmp[0].c -= (IF_RAD) / cos(atan(mid_m[3]));
+	if_inner_tmp[1].c -= (IF_RAD) / cos(atan(mid_m[0]));
+
+	// Get the center of the turning curves
+	turn_center_intersec[0] = getIntersec(fg_inner_tmp[0], fg_inner_tmp[1]);
+	turn_center_intersec[1] = getIntersec(gh_inner_tmp[0], gh_inner_tmp[1]);
+	turn_center_intersec[2] = getIntersec(hi_inner_tmp[0], hi_inner_tmp[1]);
+	turn_center_intersec[3] = getIntersec(if_inner_tmp[0], if_inner_tmp[1]);
+
+	nominal_fcn[0] = getNominal(mid_fcn[0], turn_center_intersec[0]);
+	nominal_fcn[1] = getNominal(mid_fcn[1], turn_center_intersec[0]);
+	nominal_fcn[2] = getNominal(mid_fcn[1], turn_center_intersec[1]);
+	nominal_fcn[3] = getNominal(mid_fcn[2], turn_center_intersec[1]);
+	nominal_fcn[4] = getNominal(mid_fcn[2], turn_center_intersec[2]);
+	nominal_fcn[5] = getNominal(mid_fcn[3], turn_center_intersec[2]);
+	nominal_fcn[6] = getNominal(mid_fcn[3], turn_center_intersec[3]);
+	nominal_fcn[7] = getNominal(mid_fcn[0], turn_center_intersec[3]);
+}
+
+main() {
 
 
 	// Record runtime 
@@ -581,8 +1019,9 @@ int main() {
 	Control output_u0;
 	Control* dev_u_opt, * dev_u_opt_part, * dev_u_opt_part2, * dev_u_opt_part3, * host_u_opt;
 	Control* dev_temp_u_opt;
-	State host_x0 = { 150.91,126.71,-1,2 };
+	//State host_x0 = { 150.91,126.71,-1,2 };
 	//State host_x0 = { 136, 138,-1,2 };
+	State host_x0 = { 128, 144,-1,2 };
 	//State host_x0 = { 7,31.5, 2.5, 2.726 };
 	State* dev_x0;
 	State* dev_stateList, * host_stateList;
@@ -601,6 +1040,7 @@ int main() {
 		{152 ,120.5 ,1},
 		{152 ,119   ,1}
 	};
+	//Obs host_obstacle[] = { 0 };
 	Obs* dev_obstacle;
 	int NUM_OBS = sizeof(host_obstacle) / sizeof(Obs);
 
@@ -611,10 +1051,10 @@ int main() {
 		{1.0000, -1.36070, -33.13473},
 		{1.0000, 0.47203, -35.00739}
 	};
-	Track* host_in_fcn, * host_out_fcn;
-	Track* dev_mid_fcn, * dev_in_fcn, * dev_out_fcn;
-	Pos* host_mid_intersec, * host_in_intersec, * host_out_intersec;
-	Pos* dev_mid_intersec, * dev_in_intersec, * dev_out_intersec;
+	Track* host_in_fcn, * host_out_fcn, * host_nominal_fcn;
+	Track* dev_mid_fcn, * dev_in_fcn, * dev_out_fcn, *dev_nominal_fcn;
+	Pos* host_mid_intersec, * host_in_intersec, * host_out_intersec, * host_turn_circle_intersec;
+	Pos* dev_mid_intersec, * dev_in_intersec, * dev_out_intersec, * dev_turn_circle_intersec;
 
 	// Setup host memory
 	host_V = (Control*)malloc(int(K * N_HRZ) * sizeof(Control));
@@ -627,7 +1067,8 @@ int main() {
 	host_out_intersec = (Pos*)malloc(4 * sizeof(Pos));
 	host_U = (Control*)malloc(int(N_HRZ) * sizeof(Control));
 	host_rollout_costList = (float*)malloc(int(K) * sizeof(float));
-
+	host_nominal_fcn = (Track*)malloc(8 * sizeof(Track));
+	host_turn_circle_intersec = (Pos*)malloc(4 * sizeof(Pos));
 
 	// Setup device memory
 	//cudaMalloc((void**)&/*dev_cstate*/, int(K * N_HRZ) * sizeof(curandState));
@@ -639,9 +1080,11 @@ int main() {
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_mid_fcn, 4 * sizeof(Track)));
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_in_fcn, 4 * sizeof(Track)));
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_out_fcn, 4 * sizeof(Track)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_nominal_fcn, 8 * sizeof(Track)));
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_mid_intersec, 4 * sizeof(Pos)));
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_in_intersec, 4 * sizeof(Pos)));
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_out_intersec, 4 * sizeof(Pos)));
+	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_turn_circle_intersec, 4 * sizeof(Pos)));
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_rho, int(K) * sizeof(float)));
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_w_tilde, int(K) * sizeof(float)));
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_eta, int(K) * sizeof(float)));
@@ -654,13 +1097,16 @@ int main() {
 	CUDA_SAFE_CALL(cudaMalloc((void**)&dev_obstacle, NUM_OBS * sizeof(Obs)));
 
 	// Setup constant memory
-	build_track(host_in_fcn, host_out_fcn, host_mid_intersec, host_in_intersec, host_out_intersec, host_mid_fcn);
+	//build_track(host_in_fcn, host_out_fcn, host_mid_intersec, host_in_intersec, host_out_intersec, host_mid_fcn);
+	build_track(host_in_fcn, host_out_fcn, host_mid_intersec, host_in_intersec, host_out_intersec, host_mid_fcn, host_turn_circle_intersec, host_nominal_fcn);
 	CUDA_SAFE_CALL(cudaMemcpy(dev_mid_fcn, host_mid_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpy(dev_in_fcn, host_in_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpy(dev_out_fcn, host_out_fcn, 4 * sizeof(Track), cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL(cudaMemcpy(dev_nominal_fcn, host_nominal_fcn, 8 * sizeof(Track), cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpy(dev_mid_intersec, host_mid_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpy(dev_in_intersec, host_in_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpy(dev_out_intersec, host_out_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice));
+	CUDA_SAFE_CALL(cudaMemcpy(dev_turn_circle_intersec, host_turn_circle_intersec, 4 * sizeof(Pos), cudaMemcpyHostToDevice));
 	CUDA_SAFE_CALL(cudaMemcpy(dev_obstacle, host_obstacle, NUM_OBS * sizeof(Obs), cudaMemcpyHostToDevice));
 
 	// Initialize nominal conrtrol
@@ -678,7 +1124,7 @@ int main() {
 	std::fstream predFile;
 
 	// create a name for the file output
-	outputFile.open("MPC_output4.csv", ios::out | ios::app);
+	outputFile.open("MPC_output11.csv", ios::out | ios::app);
 	testFile.open("testFile.csv", ios::out | ios::app);
 	cost.open("costroll.csv", ios::out | ios::app);
 	predFile.open("predstate.csv", ios::out | ios::app);
@@ -712,7 +1158,10 @@ int main() {
 
 		genState << <K / 256, K / 4 >> > (dev_stateList, dev_x0, dev_V);
 
-		costFcn << <int(N_HRZ) * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn, dev_obstacle);
+		costFcn << <int(N_HRZ) * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn, dev_nominal_fcn, dev_obstacle, dev_turn_circle_intersec);
+		//costFcnStraight << <int(N_HRZ) * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn, dev_obstacle, dev_in_intersec);
+		//costFcn_old << <int(N_HRZ) * 4, K / 4 >> > (dev_state_costList, dev_stateList, dev_out_fcn, dev_in_fcn, dev_obstacle);
+		PertCost << <K, int(N_HRZ) >> > (dev_state_costList, dev_V, dev_U);
 
 		calcRolloutCost2 << <K, int(N_HRZ) >> > (dev_state_costList, dev_rollout_costList);
 
