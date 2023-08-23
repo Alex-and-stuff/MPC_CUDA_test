@@ -402,7 +402,8 @@ __device__ float calculateCost(State* state, Track* outer_fcn, Track* inner_fcn,
 		}
 	}
 	
-	state_cost += distance / (ROAD_WIDTH / 2) * TRACK_ERR_COST;
+	//state_cost += distance / (ROAD_WIDTH / 2) * TRACK_ERR_COST;
+	state_cost += 0.8 * distance*distance * TRACK_ERR_COST;
 	return state_cost;
 }
 
@@ -1124,7 +1125,7 @@ main() {
 	std::fstream predFile;
 
 	// create a name for the file output
-	outputFile.open("MPC_output11.csv", ios::out | ios::app);
+	outputFile.open("MPC_output0606-1.csv", ios::out | ios::app);
 	testFile.open("testFile.csv", ios::out | ios::app);
 	cost.open("costroll.csv", ios::out | ios::app);
 	predFile.open("predstate.csv", ios::out | ios::app);
